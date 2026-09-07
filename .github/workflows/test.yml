@@ -1,0 +1,21 @@
+name: Prueba VTEX
+
+on:
+
+  workflow_dispatch:
+
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+
+  prueba:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Mostrar mensaje
+        run: |
+          echo "Hola Javier"
+          echo "GitHub Actions esta funcionando"
