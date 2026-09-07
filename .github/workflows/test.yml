@@ -1,4 +1,4 @@
-name: Prueba Python
+name: VTEX Test
 
 on:
 
@@ -14,10 +14,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Instalar Python
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install requests
 
       - name: Ejecutar script
         run: |
