@@ -1,21 +1,24 @@
-name: Prueba VTEX
+name: Prueba Python
 
 on:
 
   workflow_dispatch:
 
-  schedule:
-    - cron: '0 8 * * *'
-
 jobs:
 
-  prueba:
+  python:
 
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Mostrar mensaje
+      - uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ejecutar script
         run: |
-          echo "Hola Javier"
-          echo "GitHub Actions esta funcionando"
+          python main.py
