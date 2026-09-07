@@ -38,3 +38,12 @@ jobs:
         with:
           name: catalogo_CAM
           path: catalogo_CAM.csv
+          
+      - name: Crear Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          files: catalogo_CAM.csv
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
