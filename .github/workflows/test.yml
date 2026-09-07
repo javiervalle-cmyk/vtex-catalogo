@@ -28,7 +28,11 @@ jobs:
       - name: Ejecutar catalogo
         run: |
           python main.py
-
+          
+      - name: Ver tamaño CSV
+        run: |
+          ls -lh catalogo_CAM.csv
+          
       - name: Guardar CSV
         uses: actions/upload-artifact@v4
         with:
