@@ -1,7 +1,8 @@
 import requests
 import pandas as pd
+import time
+
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
 PAISES = {
     "SV": "https://sv.siman.com",
@@ -12,23 +13,49 @@ PAISES = {
 
 PAGE_SIZE = 50
 MAX_ITEMS = 2500
+MAX_REINTENTOS = 4
+
+categorias_error = []
 
 
 def obtener_json(url):
-    r = requests.get(
-        url,
-        headers={"Accept": "application/json"},
-        timeout=60
-    )
 
-    r.raise_for_status()
+    for intento in range(MAX_REINTENTOS):
 
-    return r.json()
+        try:
+
+            r = requests.get(
+                url,
+                headers={
+                    "Accept": "application/json"
+                },
+                timeout=60
+            )
+
+            r.raise_for_status()
+
+            return r.json()
+
+        except Exception as e:
+
+            if intento == MAX_REINTENTOS - 1:
+                raise
+
+            espera = 2 ** (intento + 1)
+
+            print(
+                f"Reintento {intento+1}: {url}"
+            )
+
+            time.sleep(espera)
 
 
 def obtener_categorias(base_url):
 
-    url = f"{base_url}/api/catalog_system/pub/category/tree/5"
+    url = (
+        f"{base_url}/api/catalog_system/"
+        f"pub/category/tree/5"
+    )
 
     return obtener_json(url)
 
@@ -47,7 +74,8 @@ def obtener_productos_categoria(
         hasta = desde + PAGE_SIZE - 1
 
         url = (
-            f"{base_url}/api/catalog_system/pub/products/search"
+            f"{base_url}"
+            f"/api/catalog_system/pub/products/search"
             f"?fq=C:/{categoria_id}/"
             f"&_from={desde}"
             f"&_to={hasta}"
@@ -84,7 +112,13 @@ def categorias_recursivas(
 
     categorias = [clave]
 
-    for hijo in nodo.get("children", []):
+    hijos = nodo.get(
+        "children",
+        []
+    )
+
+    for hijo in hijos:
+
         categorias.extend(
             categorias_recursivas(
                 hijo,
@@ -95,6 +129,32 @@ def categorias_recursivas(
     return categorias
 
 
+def obtener_seller(item):
+
+    sellers = item.get(
+        "sellers",
+        []
+    )
+
+    if len(sellers) == 0:
+        return None
+
+    default = next(
+        (
+            s for s in sellers
+            if s.get(
+                "sellerDefault"
+            )
+        ),
+        None
+    )
+
+    if default:
+        return default
+
+    return sellers[0]
+
+
 def procesar_producto(
     pais,
     producto
@@ -102,23 +162,17 @@ def procesar_producto(
 
     filas = []
 
-    for item in producto.get("items", []):
+    items = producto.get(
+        "items",
+        []
+    )
 
-        sellers = item.get(
-            "sellers",
-            []
-        )
+    for item in items:
 
-        if len(sellers) == 0:
+        seller = obtener_seller(item)
+
+        if seller is None:
             continue
-
-        seller = next(
-            (
-                s for s in sellers
-                if s.get("sellerDefault")
-            ),
-            sellers[0]
-        )
 
         offer = seller.get(
             "commertialOffer",
@@ -131,20 +185,37 @@ def procesar_producto(
         )
 
         visible = (
-            offer.get("IsAvailable", False)
+            offer.get(
+                "IsAvailable",
+                False
+            )
             and stock > 0
         )
-
-        imagen_url = None
 
         images = item.get(
             "images",
             []
         )
 
+        imagen_url = None
+
         if len(images) > 0:
+
             imagen_url = images[0].get(
                 "imageUrl"
+            )
+
+        reference_id = None
+
+        refs = item.get(
+            "referenceId",
+            []
+        )
+
+        if len(refs) > 0:
+
+            reference_id = refs[0].get(
+                "Value"
             )
 
         filas.append({
@@ -157,24 +228,27 @@ def procesar_producto(
                 ),
 
             "productId":
-                producto.get("productId"),
-
-            "productName":
-                producto.get("productName"),
-
-            "ref_sku":
-                item.get(
-                    "referenceId",
-                    [{}]
-                )[0].get(
-                    "Value"
+                producto.get(
+                    "productId"
                 ),
 
+            "productName":
+                producto.get(
+                    "productName"
+                ),
+
+            "ref_sku":
+                reference_id,
+
             "sku_id":
-                item.get("itemId"),
+                item.get(
+                    "itemId"
+                ),
 
             "variante":
-                item.get("name"),
+                item.get(
+                    "name"
+                ),
 
             "visible":
                 "Y" if visible else "N",
@@ -191,10 +265,14 @@ def procesar_producto(
                 stock,
 
             "precio_regular":
-                offer.get("ListPrice"),
+                offer.get(
+                    "ListPrice"
+                ),
 
             "precio_actual":
-                offer.get("Price"),
+                offer.get(
+                    "Price"
+                ),
 
             "es_propio":
                 (
@@ -212,15 +290,17 @@ def procesar_producto(
                 ),
 
             "brand":
-                producto.get("brand"),
+                producto.get(
+                    "brand"
+                ),
 
             "link":
-                producto.get("link"),
+                producto.get(
+                    "link"
+                ),
 
-            # NUEVO CAMPO
             "imagen_url":
                 imagen_url
-
         })
 
     return filas
@@ -231,7 +311,9 @@ def procesar_pais(
     base_url
 ):
 
-    print(f"Procesando {pais}")
+    print(
+        f"Procesando {pais}"
+    )
 
     categorias = obtener_categorias(
         base_url
@@ -240,8 +322,11 @@ def procesar_pais(
     claves = []
 
     for raiz in categorias:
+
         claves.extend(
-            categorias_recursivas(raiz)
+            categorias_recursivas(
+                raiz
+            )
         )
 
     filas = []
@@ -258,6 +343,7 @@ def procesar_pais(
             )
 
             for p in productos:
+
                 filas.extend(
                     procesar_producto(
                         pais,
@@ -266,6 +352,14 @@ def procesar_pais(
                 )
 
         except Exception as e:
+
+            categorias_error.append(
+                (
+                    pais,
+                    categoria
+                )
+            )
+
             print(
                 pais,
                 categoria,
@@ -282,6 +376,8 @@ def procesar_pais(
 
 
 def main():
+
+    datos = []
 
     with ThreadPoolExecutor(
         max_workers=4
@@ -300,12 +396,53 @@ def main():
 
         ]
 
-        datos = []
-
         for future in futures:
+
             datos.extend(
                 future.result()
             )
+
+    # RESCATE
+
+    if len(categorias_error) > 0:
+
+        print(
+            "\nINICIANDO RESCATE\n"
+        )
+
+        pendientes = (
+            categorias_error.copy()
+        )
+
+        categorias_error.clear()
+
+        for pais, categoria in pendientes:
+
+            try:
+
+                productos = (
+                    obtener_productos_categoria(
+                        PAISES[pais],
+                        categoria
+                    )
+                )
+
+                for p in productos:
+
+                    datos.extend(
+                        procesar_producto(
+                            pais,
+                            p
+                        )
+                    )
+
+            except Exception:
+
+                print(
+                    f"No recuperada: "
+                    f"{pais} "
+                    f"{categoria}"
+                )
 
     df = pd.DataFrame(datos)
 
@@ -317,7 +454,9 @@ def main():
         inplace=True
     )
 
-    archivo = "catalogo_CAM.csv"
+    archivo = (
+        "catalogo_CAM.csv"
+    )
 
     df.to_csv(
         archivo,
@@ -327,14 +466,31 @@ def main():
     )
 
     print(
-        archivo,
-        "generado"
+        f"\n{archivo} generado"
     )
 
     print(
-        "filas:",
-        len(df)
+        f"Filas finales: {len(df)}"
     )
+
+    print(
+        "\nRESUMEN"
+    )
+
+    for pais in sorted(
+        df["pais"].unique()
+    ):
+
+        total = len(
+            df[
+                df["pais"] == pais
+            ]
+        )
+
+        print(
+            pais,
+            total
+        )
 
 
 if __name__ == "__main__":
