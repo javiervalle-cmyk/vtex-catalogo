@@ -54,15 +54,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git fetch origin
+          git add data/*.csv || true
+          git add data/*.parquet || true
 
-          git checkout main
+          git commit -m "Actualizacion automatica Meta Ads" || exit 0
 
-          git pull --rebase origin main
-
-          git add data/*.csv
-          git add data/*.parquet
-
-          git commit -m "Actualización automática Meta Ads" || echo "Sin cambios para publicar"
-
-          git push origin main
+          git push origin HEAD:main
