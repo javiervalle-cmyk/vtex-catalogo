@@ -3,7 +3,7 @@ from datetime import date
 
 API_VERSION = "v26.0"
 
-FECHA_INICIO = date(2025, 9, 1)
+FECHA_INICIO = date(2026, 9, 1)
 
 ACCOUNTS = [
     {
