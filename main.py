@@ -1,18 +1,10 @@
 import csv
-import hashlib
 import json
 import os
-import random
-import sqlite3
-import threading
 import time
-import uuid
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
-from pathlib import Path
 
 import requests
 
@@ -24,11 +16,11 @@ import requests
 ACCOUNT = os.getenv("VTEX_ACCOUNT", "siman").strip()
 APP_KEY = os.getenv("VTEX_APP_KEY", "").strip()
 APP_TOKEN = os.getenv("VTEX_APP_TOKEN", "").strip()
+
 SELLER_ID = os.getenv("VTEX_SELLER_ID", "1").strip()
 
-WORKERS = max(
-    1,
-    min(int(os.getenv("MAX_WORKERS", "2")), 4),
+SOLO_PRUEBA = (
+    os.getenv("SOLO_PRUEBA", "true").lower() == "true"
 )
 
 RPS = max(
@@ -36,19 +28,11 @@ RPS = max(
     min(float(os.getenv("REQUESTS_PER_SECOND", "2")), 5),
 )
 
-MINUTOS = max(
-    1,
-    min(int(os.getenv("MAX_MINUTES", "240")), 270),
-)
-
-SOLO_PRUEBA = (
-    os.getenv("SOLO_PRUEBA", "false").lower() == "true"
-)
-
-MAX_REINTENTOS = 4
-MAX_ERRORES_PAIS = 3
-
 BASE = f"https://{ACCOUNT}.vtexcommercestable.com.br"
+
+ARCHIVO = "catalogo_CAM.csv"
+MAX_REINTENTOS = 4
+MAX_SKU_PRUEBA = 3
 
 PAISES = {
     "SV": {
@@ -68,12 +52,6 @@ PAISES = {
         "sc": os.getenv("SC_CR", "2").strip(),
     },
 }
-
-ARCHIVO = "catalogo_CAM.csv"
-ESTADO = Path(".vtex-state/checkpoint.sqlite")
-
-RUN_ID = uuid.uuid4().hex
-DEADLINE = time.monotonic() + MINUTOS * 60
 
 COLUMNAS = [
     # Columnas originales
@@ -131,29 +109,30 @@ COLUMNAS = [
     "extraccion_completa",
 ]
 
-LOCAL = threading.local()
-LOCK_RATE = threading.Lock()
-LOCK_PAIS = threading.Lock()
+FECHA_INICIO = datetime.now(timezone.utc).isoformat()
 
-PROXIMA_SOLICITUD = 0.0
+PRIVADA = requests.Session()
+PUBLICA = requests.Session()
 
-CIRCUITOS = {
-    pais: {
-        "errores": 0,
-        "abierto": False,
-        "ruta": config["url"],
-    }
-    for pais, config in PAISES.items()
-}
+PRIVADA.headers.update({
+    "Accept": "application/json",
+    "X-VTEX-API-AppKey": APP_KEY,
+    "X-VTEX-API-AppToken": APP_TOKEN,
+})
+
+PUBLICA.headers.update({
+    "Accept": "application/json",
+})
+
+ULTIMA_SOLICITUD = 0.0
+
+CACHE_PRODUCTOS = {}
+CACHE_BUSQUEDAS = {}
 
 
 # ============================================================
 # UTILIDADES
 # ============================================================
-
-class PausaExtraccion(RuntimeError):
-    pass
-
 
 class ErrorAPI(RuntimeError):
     def __init__(self, mensaje, status=None):
@@ -196,70 +175,27 @@ def texto_seguro(valor):
         texto
         .replace("\r", " ")
         .replace("\n", " ")
-    )[:700]
-
-
-def revisar_tiempo():
-    if time.monotonic() >= DEADLINE:
-        raise PausaExtraccion(
-            "Se alcanzó el tiempo de esta ejecución."
-        )
-
-
-def esperar(segundos):
-    segundos = max(0, segundos)
-
-    if time.monotonic() + segundos >= DEADLINE:
-        raise PausaExtraccion(
-            "Se guardará el avance antes de seguir esperando."
-        )
-
-    time.sleep(segundos)
+    )[:1000]
 
 
 def limitar_solicitudes():
-    global PROXIMA_SOLICITUD
+    global ULTIMA_SOLICITUD
 
-    revisar_tiempo()
+    intervalo = 1 / RPS
 
-    with LOCK_RATE:
-        instante = max(
-            time.monotonic(),
-            PROXIMA_SOLICITUD,
-        )
-
-        PROXIMA_SOLICITUD = instante + 1 / RPS
-
-    esperar(
-        max(0, instante - time.monotonic())
+    espera = (
+        ULTIMA_SOLICITUD
+        + intervalo
+        - time.monotonic()
     )
 
-    revisar_tiempo()
+    if espera > 0:
+        time.sleep(espera)
+
+    ULTIMA_SOLICITUD = time.monotonic()
 
 
-def sesion(privada):
-    nombre = "privada" if privada else "publica"
-
-    if not hasattr(LOCAL, nombre):
-        nueva = requests.Session()
-
-        nueva.headers.update({
-            "Accept": "application/json",
-            "User-Agent": "Siman-Catalogo-Auditoria/4.1",
-        })
-
-        if privada:
-            nueva.headers.update({
-                "X-VTEX-API-AppKey": APP_KEY,
-                "X-VTEX-API-AppToken": APP_TOKEN,
-            })
-
-        setattr(LOCAL, nombre, nueva)
-
-    return getattr(LOCAL, nombre)
-
-
-def retry_after(respuesta, intento):
+def tiempo_reintento(respuesta, intento):
     valor = (
         respuesta.headers.get("Retry-After")
         if respuesta is not None
@@ -285,14 +221,11 @@ def retry_after(respuesta, intento):
             ):
                 pass
 
-    return (
-        min(60, 2 ** (intento + 1))
-        + random.random()
-    )
+    return min(60, 2 ** (intento + 1))
 
 
 def obtener_json(url, privada=False, params=None):
-    global PROXIMA_SOLICITUD
+    sesion = PRIVADA if privada else PUBLICA
 
     for intento in range(MAX_REINTENTOS):
         limitar_solicitudes()
@@ -301,7 +234,7 @@ def obtener_json(url, privada=False, params=None):
         status = None
 
         try:
-            respuesta = sesion(privada).get(
+            respuesta = sesion.get(
                 url,
                 params=params,
                 timeout=(15, 45),
@@ -316,7 +249,7 @@ def obtener_json(url, privada=False, params=None):
 
                 except ValueError:
                     detalle = (
-                        "La respuesta no contiene JSON válido; "
+                        "Respuesta sin JSON válido; "
                         f"URL={respuesta.url}; "
                         f"respuesta={texto_seguro(respuesta.text)}"
                     )
@@ -332,7 +265,10 @@ def obtener_json(url, privada=False, params=None):
                     status not in (408, 429)
                     and status < 500
                 ):
-                    raise ErrorAPI(detalle, status)
+                    raise ErrorAPI(
+                        detalle,
+                        status,
+                    )
 
         except requests.RequestException as exc:
             detalle = (
@@ -341,27 +277,23 @@ def obtener_json(url, privada=False, params=None):
             )
 
         if intento == MAX_REINTENTOS - 1:
-            raise ErrorAPI(detalle, status)
+            raise ErrorAPI(
+                detalle,
+                status,
+            )
 
-        demora = retry_after(
+        espera = tiempo_reintento(
             respuesta,
             intento,
         )
 
-        if status == 429:
-            with LOCK_RATE:
-                PROXIMA_SOLICITUD = max(
-                    PROXIMA_SOLICITUD,
-                    time.monotonic() + demora,
-                )
-
         print(
-            f"Reintento {intento + 1}: "
-            f"{detalle}; espera={demora:.1f}s",
+            f"REINTENTO {intento + 1}: "
+            f"{detalle}; espera={espera:.1f}s",
             flush=True,
         )
 
-        esperar(demora)
+        time.sleep(espera)
 
     raise ErrorAPI("Consulta sin resultado.")
 
@@ -374,119 +306,105 @@ def api(ruta, params=None):
     )
 
 
-def objeto(valor, nombre):
+def validar_objeto(valor, descripcion):
     if not isinstance(valor, dict) or not valor:
         raise ErrorAPI(
-            f"Respuesta inesperada para {nombre}."
+            f"Respuesta inesperada para {descripcion}."
         )
 
     return valor
 
 
+def salida_github(nombre, valor):
+    ruta = os.getenv("GITHUB_OUTPUT")
+
+    if ruta:
+        with open(
+            ruta,
+            "a",
+            encoding="utf-8",
+        ) as archivo:
+            archivo.write(
+                f"{nombre}={valor}\n"
+            )
+
+
 # ============================================================
-# ESTADO PARA REANUDAR
+# POLÍTICAS COMERCIALES
 # ============================================================
 
-def abrir_estado():
-    ESTADO.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+def cargar_politicas():
+    resultado = api(
+        "/api/catalog_system/pvt/saleschannel/list"
     )
 
-    db = sqlite3.connect(ESTADO)
-
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            clave TEXT PRIMARY KEY,
-            valor TEXT NOT NULL
-        )
-    """)
-
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS sku (
-            id TEXT PRIMARY KEY,
-            binding TEXT NOT NULL,
-            estado INTEGER NOT NULL DEFAULT 0,
-            filas TEXT,
-            error TEXT,
-            ultima_ejecucion TEXT
-        )
-    """)
-
-    db.execute("""
-        CREATE INDEX IF NOT EXISTS idx_sku_estado
-        ON sku (estado)
-    """)
-
-    db.commit()
-    return db
-
-
-def leer_meta(db, clave, defecto=None):
-    fila = db.execute(
-        "SELECT valor FROM meta WHERE clave = ?",
-        (clave,),
-    ).fetchone()
-
-    return fila[0] if fila else defecto
-
-
-def escribir_meta(db, clave, valor):
-    db.execute(
-        "INSERT OR REPLACE INTO meta VALUES (?, ?)",
-        (clave, str(valor)),
-    )
-
-
-def preparar_ciclo(db):
-    firma = hashlib.sha256(
-        json.dumps(
-            {
-                "version": 4,
-                "cuenta": ACCOUNT,
-                "seller": SELLER_ID,
-                "paises": PAISES,
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
-
-    anterior = leer_meta(db, "firma")
-
-    if anterior and anterior != firma:
-        raise RuntimeError(
-            "La configuración no coincide con el avance guardado. "
-            "Ejecuta el flujo con reiniciar=true."
-        )
-
-    if leer_meta(db, "completo") == "1":
-        db.execute("DELETE FROM sku")
-        db.execute("DELETE FROM meta")
-
-    escribir_meta(db, "firma", firma)
-
-    if not leer_meta(db, "inicio"):
-        escribir_meta(db, "inicio", ahora())
-
-    db.commit()
-
-
-# ============================================================
-# LISTADO DEL SELLER Y DIAGNÓSTICO
-# ============================================================
-
-def cargar_sku_siman(db):
-    # Esta versión es únicamente una prueba controlada.
-    # Impide iniciar un recorrido masivo accidentalmente.
-    if not SOLO_PRUEBA:
+    if not isinstance(resultado, list):
         raise ErrorAPI(
-            "Esta versión requiere solo_prueba=true. "
-            "Primero debemos validar la consulta de muestra."
+            "El listado de políticas no es una lista."
+        )
+
+    politicas = {}
+
+    print(
+        "\nPOLITICAS COMERCIALES DE LA CUENTA",
+        flush=True,
+    )
+
+    for politica in resultado:
+        if (
+            not isinstance(politica, dict)
+            or politica.get("Id") is None
+        ):
+            raise ErrorAPI(
+                "El listado contiene una política inválida."
+            )
+
+        politica_id = str(politica["Id"])
+        politicas[politica_id] = politica
+
+        print(
+            f"ID={politica_id}; "
+            f"Nombre={politica.get('Name')}; "
+            f"Activa={politica.get('IsActive')}; "
+            f"Pais={politica.get('CountryCode')}; "
+            f"Moneda={politica.get('CurrencyCode')}",
+            flush=True,
         )
 
     print(
-        "PRUEBA: consultando únicamente 3 ID "
-        "del catálogo administrativo.",
+        "\nPOLITICAS CONFIGURADAS EN EL FLUJO",
+        flush=True,
+    )
+
+    for pais, config in PAISES.items():
+        sc = config["sc"]
+
+        if sc not in politicas:
+            raise ErrorAPI(
+                f"No existe la política {sc} "
+                f"configurada para {pais}."
+            )
+
+        politica = politicas[sc]
+
+        print(
+            f"{pais}: ID={sc}; "
+            f"Nombre={politica.get('Name')}; "
+            f"Activa={politica.get('IsActive')}",
+            flush=True,
+        )
+
+    return politicas
+
+
+# ============================================================
+# MUESTRA DE HASTA TRES SKU PROPIOS
+# ============================================================
+
+def cargar_muestra():
+    print(
+        "\nPRUEBA: consultando únicamente "
+        "tres ID administrativos.",
         flush=True,
     )
 
@@ -494,7 +412,7 @@ def cargar_sku_siman(db):
         "/api/catalog_system/pvt/sku/stockkeepingunitids",
         params={
             "page": 1,
-            "pagesize": 3,
+            "pagesize": MAX_SKU_PRUEBA,
         },
     )
 
@@ -504,16 +422,14 @@ def cargar_sku_siman(db):
             "una lista válida de ID."
         )
 
-    # Aunque el servicio devolviera más resultados,
-    # esta prueba nunca procesa más de tres.
-    ids = ids[:3]
+    ids = ids[:MAX_SKU_PRUEBA]
 
     print(
         f"PRUEBA: ID recibidos={ids}",
         flush=True,
     )
 
-    registros = {}
+    muestra = []
 
     for valor in ids:
         sku_id = str(valor)
@@ -523,20 +439,19 @@ def cargar_sku_siman(db):
                 "El listado contiene un ID inválido."
             )
 
-        contexto = objeto(
+        contexto = validar_objeto(
             api(
                 "/api/catalog_system/pvt/sku/"
                 f"stockkeepingunitbyid/{sku_id}"
             ),
-            f"contexto de prueba {sku_id}",
+            f"contexto del SKU {sku_id}",
         )
 
         sellers = contexto.get("SkuSellers") or []
 
         if not isinstance(sellers, list):
             raise ErrorAPI(
-                f"SkuSellers tiene un formato inesperado "
-                f"para el SKU {sku_id}."
+                f"SkuSellers inválido para SKU {sku_id}."
             )
 
         sellers_ids = [
@@ -565,72 +480,44 @@ def cargar_sku_siman(db):
         )
 
         if propio is not None:
-            # No exige IsActive=True:
-            # también necesitamos los propios inactivos.
-            registros[sku_id] = propio
+            muestra.append({
+                "sku_id": sku_id,
+                "binding": propio,
+                "contexto": contexto,
+            })
 
-    if not registros:
+    if not muestra:
         raise ErrorAPI(
-            "Ninguno de los tres SKU de muestra tiene "
-            "un vínculo confirmado con el seller de Siman. "
-            "Necesitamos probar con un ID interno de VTEX "
-            "de un producto propio conocido."
+            "La muestra no contiene SKU propios confirmados."
         )
 
-    with db:
-        # Reinicia únicamente la muestra de diagnóstico.
-        # La extracción completa está bloqueada arriba.
-        db.execute("DELETE FROM sku")
+    return muestra
 
-        db.execute(
-            "DELETE FROM meta "
-            "WHERE clave IN ('listado_completo', 'completo')"
-        )
-
-        db.executemany(
-            """
-            INSERT INTO sku (id, binding)
-            VALUES (?, ?)
-            """,
-            (
-                (
-                    sku_id,
-                    json.dumps(
-                        binding,
-                        ensure_ascii=False,
-                    ),
-                )
-                for sku_id, binding in registros.items()
-            ),
-        )
-
-    print(
-        f"PRUEBA: {len(registros)} SKU propios confirmados. "
-        "Se consultarán sus datos en los cuatro países.",
-        flush=True,
-    )
 
 # ============================================================
-# DATOS ADMINISTRATIVOS
+# PRODUCTOS Y POLÍTICAS ASOCIADAS
 # ============================================================
 
-@lru_cache(maxsize=4096)
 def cargar_producto(product_id):
-    producto = objeto(
+    clave = str(product_id)
+
+    if clave in CACHE_PRODUCTOS:
+        return CACHE_PRODUCTOS[clave]
+
+    producto = validar_objeto(
         api(
-            f"/api/catalog/pvt/product/{product_id}"
+            f"/api/catalog/pvt/product/{clave}"
         ),
-        f"producto {product_id}",
+        f"producto {clave}",
     )
 
     resultado = api(
-        f"/api/catalog/pvt/product/"
-        f"{product_id}/salespolicy"
+        f"/api/catalog/pvt/product/{clave}/salespolicy"
     )
 
     if not isinstance(resultado, list):
         raise ErrorAPI(
-            f"Políticas inválidas para producto {product_id}."
+            f"Políticas inválidas para producto {clave}."
         )
 
     politicas = set()
@@ -641,45 +528,34 @@ def cargar_producto(product_id):
             or politica.get("StoreId") is None
         ):
             raise ErrorAPI(
-                f"Política sin StoreId: "
-                f"producto {product_id}."
+                f"Política sin StoreId para producto {clave}."
             )
 
         politicas.add(
             str(politica["StoreId"])
         )
 
-    return producto, politicas
+    CACHE_PRODUCTOS[clave] = (
+        producto,
+        politicas,
+    )
+
+    return CACHE_PRODUCTOS[clave]
 
 
-def cargar_contexto(sku_id):
-    try:
-        contexto = objeto(
-            api(
-                "/api/catalog_system/pvt/sku/"
-                f"stockkeepingunitbyid/{sku_id}"
-            ),
-            f"contexto {sku_id}",
-        )
-
-        return contexto, ""
-
-    except ErrorAPI as exc:
-        if exc.status in (401, 403):
-            raise
-
-        return {}, texto_seguro(exc)
-
+# ============================================================
+# INVENTARIO
+# ============================================================
 
 def cargar_inventario(sku_id):
-    inventario = objeto(
+    resultado = validar_objeto(
         api(
             f"/api/logistics/pvt/inventory/skus/{sku_id}"
         ),
-        f"inventario {sku_id}",
+        f"inventario del SKU {sku_id}",
     )
 
-    balances = inventario.get("balance")
+    balances = resultado.get("balance")
 
     if not isinstance(balances, list):
         raise ErrorAPI(
@@ -691,7 +567,7 @@ def cargar_inventario(sku_id):
     for balance in balances:
         if not isinstance(balance, dict):
             raise ErrorAPI(
-                f"Balance inválido: SKU {sku_id}."
+                f"Balance inválido para SKU {sku_id}."
             )
 
         total = numero(
@@ -728,42 +604,29 @@ def cargar_inventario(sku_id):
 
 
 # ============================================================
-# CONSULTA PÚBLICA POR PRODUCTO Y PAÍS
+# BÚSQUEDA PÚBLICA
 # ============================================================
 
-@lru_cache(maxsize=4096)
 def buscar_producto(pais, product_id):
+    clave = (
+        pais,
+        str(product_id),
+    )
+
+    if clave in CACHE_BUSQUEDAS:
+        return CACHE_BUSQUEDAS[clave]
+
     config = PAISES[pais]
-
-    with LOCK_PAIS:
-        circuito = CIRCUITOS[pais]
-
-        if circuito["abierto"]:
-            return {
-                "ok": False,
-                "items": {},
-                "fuente": "",
-                "error": (
-                    f"Consultas de {pais} pausadas "
-                    "por errores repetidos."
-                ),
-            }
-
-        preferida = circuito["ruta"]
-
-    # Nunca elimina ni cambia la política comercial.
-    rutas = list(dict.fromkeys([
-        preferida,
-        config["url"],
-        BASE,
-    ]))
-
     errores = []
     fuente = ""
 
-    for ruta in rutas:
+    # Ambas consultas mantienen exactamente el mismo sc.
+    for dominio in (
+        config["url"],
+        BASE,
+    ):
         fuente = (
-            ruta
+            dominio
             + "/api/catalog_system/pub/products/search"
         )
 
@@ -806,72 +669,56 @@ def buscar_producto(pais, product_id):
                     if item_id is not None:
                         items[str(item_id)] = item
 
-            with LOCK_PAIS:
-                CIRCUITOS[pais]["errores"] = 0
-                CIRCUITOS[pais]["ruta"] = ruta
-
-            if errores:
-                print(
-                    f"{pais}: se utilizó {ruta} "
-                    f"con sc={config['sc']}. "
-                    "El dominio anterior rechazó la consulta.",
-                    flush=True,
-                )
-
-            return {
+            resultado = {
                 "ok": True,
                 "items": items,
                 "fuente": fuente,
                 "error": "",
             }
 
+            CACHE_BUSQUEDAS[clave] = resultado
+            return resultado
+
         except ErrorAPI as exc:
             errores.append(
                 texto_seguro(exc)
             )
 
+            # Solo prueba otra ruta ante HTTP 400 o 404.
             if exc.status not in (400, 404):
                 break
 
-    detalle = " | ".join(errores)
-
-    with LOCK_PAIS:
-        CIRCUITOS[pais]["errores"] += 1
-
-        if (
-            CIRCUITOS[pais]["errores"]
-            >= MAX_ERRORES_PAIS
-        ):
-            CIRCUITOS[pais]["abierto"] = True
-
-    print(
-        f"ERROR PUBLICO {pais}, "
-        f"producto {product_id}: {detalle}",
-        flush=True,
-    )
-
-    return {
+    resultado = {
         "ok": False,
         "items": {},
         "fuente": fuente,
-        "error": detalle,
+        "error": " | ".join(errores),
     }
 
+    print(
+        f"ERROR PUBLICO {pais}, producto {product_id}: "
+        f"{resultado['error']}",
+        flush=True,
+    )
+
+    CACHE_BUSQUEDAS[clave] = resultado
+    return resultado
+
 
 # ============================================================
-# PROCESAMIENTO DE SKU
+# PROCESAMIENTO
 # ============================================================
 
-def procesar_sku(
-    sku_id,
-    binding,
-    politicas_catalogo,
-):
-    sku = objeto(
+def procesar_sku(muestra, politicas_catalogo):
+    sku_id = muestra["sku_id"]
+    binding = muestra["binding"]
+    contexto = muestra["contexto"]
+
+    sku = validar_objeto(
         api(
             f"/api/catalog/pvt/stockkeepingunit/{sku_id}"
         ),
-        f"SKU {sku_id}",
+        f"SKU administrativo {sku_id}",
     )
 
     product_id = sku.get("ProductId")
@@ -882,17 +729,15 @@ def procesar_sku(
         )
 
     producto, politicas = cargar_producto(
-        str(product_id)
-    )
-
-    contexto, error_contexto = cargar_contexto(
-        sku_id
+        product_id
     )
 
     error_inventario = ""
 
     try:
-        bodegas = cargar_inventario(sku_id)
+        bodegas = cargar_inventario(
+            sku_id
+        )
 
     except ErrorAPI as exc:
         bodegas = None
@@ -909,7 +754,7 @@ def procesar_sku(
         ),
     )
 
-    nombres = [
+    nombres_politicas = [
         politicas_catalogo.get(
             politica_id,
             {},
@@ -926,20 +771,24 @@ def procesar_sku(
     if not imagen and imagenes:
         imagen = imagenes[0].get("ImageUrl")
 
-    fecha = ahora()
     filas = []
     errores = []
 
     if error_inventario:
-        errores.append(error_inventario)
+        errores.append(
+            f"SKU {sku_id}: {error_inventario}"
+        )
 
     for pais, config in PAISES.items():
         resultado = buscar_producto(
             pais,
-            str(product_id),
+            product_id,
         )
 
-        item = resultado["items"].get(sku_id)
+        item = resultado["items"].get(
+            sku_id
+        )
+
         seller = None
         oferta = {}
 
@@ -975,7 +824,8 @@ def procesar_sku(
             estado = "ERROR_CONSULTA"
 
             errores.append(
-                f"{pais}: {resultado['error']}"
+                f"SKU {sku_id}, {pais}: "
+                f"{resultado['error']}"
             )
 
         elif item is None:
@@ -1056,18 +906,6 @@ def procesar_sku(
                 "SIN_STOCK_EN_OFERTA"
             )
 
-        precio = numero(
-            oferta.get("Price")
-        )
-
-        if (
-            precio is not None
-            and precio <= 0
-        ):
-            hallazgos.append(
-                "PRECIO_CERO_EN_OFERTA"
-            )
-
         ruta = contexto.get("DetailUrl")
 
         if not ruta and producto.get("LinkId"):
@@ -1090,7 +928,7 @@ def procesar_sku(
                 )
             )
 
-        filas.append({
+        fila = {
             "pais": pais,
             "productReference": producto.get("RefId"),
             "productId": product_id,
@@ -1099,8 +937,8 @@ def procesar_sku(
             "sku_id": sku_id,
             "variante": sku.get("Name"),
 
-            # Compatibilidad con el archivo original.
-            # visible conserva la lógica de disponibilidad.
+            # Conserva el significado del archivo original:
+            # disponibilidad de la oferta, no IsVisible.
             "visible": compra,
             "estado": estado,
             "stock_sku": cantidad,
@@ -1159,7 +997,7 @@ def procesar_sku(
                 ids_politicas
             ),
             "politicas_nombres": "|".join(
-                nombres
+                nombres_politicas
             ),
 
             **{
@@ -1185,38 +1023,42 @@ def procesar_sku(
                 if bodegas is not None
                 else None
             ),
+
             "fuente_busqueda": resultado["fuente"],
             "error_busqueda": resultado["error"],
             "error_inventario": error_inventario,
-            "error_contexto": error_contexto,
+            "error_contexto": "",
             "diagnostico": " | ".join(hallazgos),
-            "fecha_extraccion_utc": fecha,
-        })
+            "fecha_extraccion_utc": ahora(),
+            "fecha_inicio_ciclo_utc": FECHA_INICIO,
 
-    return {
-        "ok": not errores,
-        "filas": filas,
-        "error": texto_seguro(
-            " | ".join(errores)
-        ),
-    }
+            # Es una muestra, nunca un catálogo completo.
+            "extraccion_completa": "N",
+        }
+
+        filas.append(fila)
+
+        print(
+            f"PRUEBA SKU={sku_id}; "
+            f"pais={pais}; "
+            f"politica={sc}; "
+            f"politica_activa="
+            f"{bandera(politica.get('IsActive'))}; "
+            f"estado={estado}; "
+            f"fuente={resultado['fuente']}",
+            flush=True,
+        )
+
+    return filas, errores
 
 
 # ============================================================
 # EXPORTACIÓN: UN SOLO CSV
 # ============================================================
 
-def exportar(db, completo):
+def guardar_csv(filas):
     temporal = ARCHIVO + ".tmp"
-    cantidad = 0
-
-    inicio = leer_meta(
-        db,
-        "inicio",
-        "",
-    )
-
-    fin = ahora()
+    fecha_fin = ahora()
 
     with open(
         temporal,
@@ -1233,43 +1075,14 @@ def exportar(db, completo):
 
         escritor.writeheader()
 
-        cursor = db.execute(
-            "SELECT filas FROM sku "
-            "WHERE filas IS NOT NULL"
-        )
-
-        for (datos,) in cursor:
-            for fila in json.loads(datos):
-                fila["fecha_inicio_ciclo_utc"] = inicio
-                fila["fecha_fin_exportacion_utc"] = fin
-
-                fila["extraccion_completa"] = (
-                    "Y" if completo else "N"
-                )
-
-                escritor.writerow(fila)
-                cantidad += 1
+        for fila in filas:
+            fila["fecha_fin_exportacion_utc"] = fecha_fin
+            escritor.writerow(fila)
 
     os.replace(
         temporal,
         ARCHIVO,
     )
-
-    return cantidad
-
-
-def salida_github(nombre, valor):
-    ruta = os.getenv("GITHUB_OUTPUT")
-
-    if ruta:
-        with open(
-            ruta,
-            "a",
-            encoding="utf-8",
-        ) as archivo:
-            archivo.write(
-                f"{nombre}={valor}\n"
-            )
 
 
 # ============================================================
@@ -1277,307 +1090,109 @@ def salida_github(nombre, valor):
 # ============================================================
 
 def main():
+    # Esta prueba nunca publica sobre el release latest.
     salida_github(
         "publicar",
         "false",
     )
 
-    db = abrir_estado()
+    filas = []
+    errores = []
 
-    fallo = False
-    pausa = False
-    intentados = 0
-    errores_seguidos = 0
-    completo = False
+    sku_muestra = 0
+    sku_con_filas = 0
+    fallo_general = False
 
     try:
+        if not SOLO_PRUEBA:
+            raise RuntimeError(
+                "Este archivo es una prueba de diagnóstico. "
+                "Ejecuta el flujo con solo_prueba marcada."
+            )
+
         if not APP_KEY or not APP_TOKEN:
             raise RuntimeError(
-                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN."
+                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN "
+                "en las variables de entorno."
             )
-
-        preparar_ciclo(db)
-
-        politicas = api(
-            "/api/catalog_system/pvt/saleschannel/list"
-        )
-
-        if not isinstance(politicas, list):
-            raise ErrorAPI(
-                "Listado de políticas inválido."
-            )
-
-        politicas_catalogo = {
-            str(politica["Id"]): politica
-            for politica in politicas
-            if (
-                isinstance(politica, dict)
-                and politica.get("Id") is not None
-            )
-        }
-
-                print(
-            "\nPOLITICAS COMERCIALES DE LA CUENTA",
-            flush=True,
-        )
-
-        for politica_id, politica in politicas_catalogo.items():
-            print(
-                f"ID={politica_id}; "
-                f"Nombre={politica.get('Name')}; "
-                f"Activa={politica.get('IsActive')}; "
-                f"Pais={politica.get('CountryCode')}",
-                flush=True,
-            )
-
-        for pais, config in PAISES.items():
-            sc = config["sc"]
-
-            if sc not in politicas_catalogo:
-                raise ErrorAPI(
-                    f"No existe la política {sc} "
-                    f"para {pais}."
-                )
-
-            print(
-                f"{pais}: política {sc} - "
-                f"{politicas_catalogo[sc].get('Name')}",
-                flush=True,
-            )
-
-        cargar_sku_siman(db)
 
         print(
-            f"Modo="
-            f"{'PRUEBA' if SOLO_PRUEBA else 'EXTRACCION'}; "
-            f"hilos={WORKERS}; "
-            f"máximo={RPS} solicitudes/s.",
+            f"Cuenta={ACCOUNT}; "
+            f"seller={SELLER_ID}; "
+            f"máximo={RPS} solicitudes/s; "
+            "modo=PRUEBA.",
             flush=True,
         )
 
-        with ThreadPoolExecutor(
-            max_workers=WORKERS
-        ) as executor:
-            while True:
-                revisar_tiempo()
+        politicas_catalogo = cargar_politicas()
+        muestra = cargar_muestra()
 
-                limite = (
-                    min(
-                        WORKERS,
-                        3 - intentados,
-                    )
-                    if SOLO_PRUEBA
-                    else WORKERS
+        sku_muestra = len(muestra)
+
+        print(
+            f"\nPRUEBA: {sku_muestra} SKU propios confirmados.",
+            flush=True,
+        )
+
+        for registro in muestra:
+            sku_id = registro["sku_id"]
+
+            try:
+                nuevas_filas, nuevos_errores = procesar_sku(
+                    registro,
+                    politicas_catalogo,
                 )
 
-                if limite <= 0:
-                    break
+                filas.extend(
+                    nuevas_filas
+                )
 
-                lote = db.execute(
-                    """
-                    SELECT id, binding
-                    FROM sku
-                    WHERE estado != 1
-                      AND COALESCE(ultima_ejecucion, '') != ?
-                    ORDER BY estado DESC, id
-                    LIMIT ?
-                    """,
-                    (
-                        RUN_ID,
-                        limite,
-                    ),
-                ).fetchall()
+                errores.extend(
+                    nuevos_errores
+                )
 
-                if not lote:
-                    break
+                sku_con_filas += 1
 
-                futuros = {
-                    executor.submit(
-                        procesar_sku,
-                        sku_id,
-                        json.loads(binding),
-                        politicas_catalogo,
-                    ): sku_id
-                    for sku_id, binding in lote
-                }
+            except Exception as exc:
+                detalle = (
+                    f"SKU {sku_id}: "
+                    f"{texto_seguro(exc)}"
+                )
 
-                for futuro in as_completed(futuros):
-                    sku_id = futuros[futuro]
-
-                    try:
-                        resultado = futuro.result()
-                        correcto = resultado["ok"]
-
-                        with db:
-                            db.execute(
-                                """
-                                UPDATE sku
-                                SET estado = ?,
-                                    filas = ?,
-                                    error = ?,
-                                    ultima_ejecucion = ?
-                                WHERE id = ?
-                                """,
-                                (
-                                    1 if correcto else 2,
-                                    json.dumps(
-                                        resultado["filas"],
-                                        ensure_ascii=False,
-                                    ),
-                                    resultado["error"],
-                                    RUN_ID,
-                                    sku_id,
-                                ),
-                            )
-
-                        if correcto:
-                            errores_seguidos = 0
-
-                        else:
-                            errores_seguidos += 1
-
-                            print(
-                                f"SKU {sku_id}: "
-                                f"{resultado['error']}",
-                                flush=True,
-                            )
-
-                        if SOLO_PRUEBA:
-                            for fila in resultado["filas"]:
-                                print(
-                                    f"PRUEBA SKU={sku_id}; "
-                                    f"pais={fila['pais']}; "
-                                    f"estado={fila['estado']}; "
-                                    f"fuente={fila['fuente_busqueda']}",
-                                    flush=True,
-                                )
-
-                    except PausaExtraccion:
-                        pausa = True
-
-                    except Exception as exc:
-                        errores_seguidos += 1
-                        detalle = texto_seguro(exc)
-
-                        with db:
-                            db.execute(
-                                """
-                                UPDATE sku
-                                SET estado = 2,
-                                    error = ?,
-                                    ultima_ejecucion = ?
-                                WHERE id = ?
-                                """,
-                                (
-                                    detalle,
-                                    RUN_ID,
-                                    sku_id,
-                                ),
-                            )
-
-                        print(
-                            f"ERROR SKU {sku_id}: {detalle}",
-                            flush=True,
-                        )
-
-                    intentados += 1
-
-                total, listos = db.execute(
-                    """
-                    SELECT COUNT(*),
-                           COALESCE(SUM(estado = 1), 0)
-                    FROM sku
-                    """
-                ).fetchone()
+                errores.append(detalle)
 
                 print(
-                    f"Avance: {listos}/{total} SKU completos; "
-                    f"intentados en esta ejecución: "
-                    f"{intentados}",
+                    f"ERROR SKU: {detalle}",
                     flush=True,
                 )
 
-                with LOCK_PAIS:
-                    abierto = any(
-                        circuito["abierto"]
-                        for circuito in CIRCUITOS.values()
-                    )
-
-                if abierto or errores_seguidos >= 3:
-                    fallo = True
-
-                    print(
-                        "Se detiene el lote por errores repetidos. "
-                        "El avance queda guardado.",
-                        flush=True,
-                    )
-
-                    break
-
-                if pausa:
-                    break
-
-        total, listos = db.execute(
-            """
-            SELECT COUNT(*),
-                   COALESCE(SUM(estado = 1), 0)
-            FROM sku
-            """
-        ).fetchone()
-
-        completo = (
-            total > 0
-            and total == listos
-            and not SOLO_PRUEBA
-            and not fallo
-            and not pausa
-        )
-
-    except PausaExtraccion:
-        pausa = True
-
-        print(
-            "Tiempo de trabajo alcanzado. "
-            "Se continuará desde el avance guardado.",
-            flush=True,
-        )
-
     except Exception as exc:
-        fallo = True
+        fallo_general = True
+
+        detalle = texto_seguro(exc)
+        errores.append(detalle)
 
         print(
-            f"ERROR GENERAL: {texto_seguro(exc)}",
+            f"ERROR GENERAL: {detalle}",
             flush=True,
         )
 
     finally:
         try:
-            filas = exportar(
-                db,
-                completo,
-            )
-
-            total, listos = db.execute(
-                """
-                SELECT COUNT(*),
-                       COALESCE(SUM(estado = 1), 0)
-                FROM sku
-                """
-            ).fetchone()
+            guardar_csv(filas)
 
             print(
                 "\nRESUMEN\n"
                 + json.dumps(
                     {
                         "archivo": ARCHIVO,
-                        "sku_del_ciclo": total,
-                        "sku_completos": listos,
-                        "sku_por_completar": total - listos,
-                        "filas_csv": filas,
-                        "solo_prueba": SOLO_PRUEBA,
-                        "extraccion_completa": completo,
-                        "pausado": pausa,
-                        "errores_repetidos": fallo,
+                        "solo_prueba": True,
+                        "sku_propios_muestra": sku_muestra,
+                        "sku_con_filas": sku_con_filas,
+                        "filas_csv": len(filas),
+                        "errores": len(errores),
+                        "extraccion_completa": False,
+                        "publicar_release": False,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -1585,41 +1200,23 @@ def main():
                 flush=True,
             )
 
-            if completo:
-                with db:
-                    escribir_meta(
-                        db,
-                        "completo",
-                        "1",
-                    )
-
-                salida_github(
-                    "publicar",
-                    "true",
-                )
-
         finally:
-            db.close()
+            PRIVADA.close()
+            PUBLICA.close()
 
-    if fallo:
+    if fallo_general or errores:
         raise SystemExit(
-            "Revisa los errores. "
-            "No se reemplazará el CSV publicado."
+            "La prueba encontró errores. "
+            "Revisa el listado de políticas y los mensajes "
+            "ERROR PUBLICO. El CSV publicado no se modifica."
         )
 
-    if SOLO_PRUEBA:
-        print(
-            "Prueba terminada. Revisa los resultados antes "
-            "de ejecutar la extracción completa.",
-            flush=True,
-        )
-
-    elif not completo:
-        print(
-            "Recorrido pendiente. No se reemplaza latest. "
-            "La próxima ejecución retomará el avance.",
-            flush=True,
-        )
+    print(
+        "Prueba terminada sin errores de consulta. "
+        "El CSV de muestra está disponible en el artefacto. "
+        "No se actualiza el release latest.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
