@@ -404,7 +404,7 @@ def cargar_politicas():
 def cargar_muestra():
     from urllib.parse import quote
 
-       muestras_conocidas = [
+    muestras_conocidas = [
         {
             "referencia": "105062291",
             "pais_esperado": "SV",
@@ -423,7 +423,7 @@ def cargar_muestra():
     errores = []
 
     print(
-        "\nPRUEBA: resolviendo referencias "
+        "\nPRUEBA: resolviendo las tres referencias "
         "a ID internos de VTEX.",
         flush=True,
     )
@@ -495,7 +495,7 @@ def cargar_muestra():
                 f"ref_sku={referencia}; "
                 f"sku_id={sku_id}; "
                 f"product_id={contexto.get('ProductId')}; "
-                f"pais_esperado={pais}; "
+                f"pais_referencia={pais}; "
                 f"politica={PAISES[pais]['sc']}",
                 flush=True,
             )
@@ -521,7 +521,7 @@ def cargar_muestra():
 
     if errores:
         raise ErrorAPI(
-            "No se pudieron resolver ambas referencias. "
+            "No se pudieron resolver todas las referencias. "
             "Revisa las líneas ERROR REFERENCIA."
         )
 
