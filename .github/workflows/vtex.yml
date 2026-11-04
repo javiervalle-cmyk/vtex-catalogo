@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       solo_prueba:
-        description: "Probar los cuatro SKU sin publicar"
+        description: "Probar hasta 100 referencias sin publicar"
         type: boolean
         default: false
       reiniciar:
@@ -37,6 +37,8 @@ jobs:
       MAX_WORKERS: "2"
       REQUESTS_PER_SECOND: "2"
       MAX_MINUTES: "220"
+      SKU_INPUT_FILE: data/skus_base.csv
+      TEST_LIMIT: "100"
       SC_SV: "1"
       SC_GT: "4"
       SC_NI: "15"
@@ -93,11 +95,11 @@ jobs:
       # Guarda el avance después de la publicación o de una pausa/error.
       # El Python lo descarga automáticamente en la próxima ejecución.
       - name: Guardar avance interno
-        if: ${{ always() && inputs.solo_prueba != true && hashFiles('.vtex-state/checkpoint.sqlite') != '' }}
+        if: ${{ always() && inputs.solo_prueba != true && hashFiles('.vtex-lista-state/checkpoint.sqlite') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: vtex-estado-produccion-v1
-          path: .vtex-state/checkpoint.sqlite
+          name: vtex-estado-lista-v1
+          path: .vtex-lista-state/checkpoint.sqlite
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
