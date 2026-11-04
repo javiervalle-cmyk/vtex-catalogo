@@ -4,21 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       solo_prueba:
-        description: "Probar únicamente 3 SKU sin publicar"
-        type: boolean
-        default: true
-
-      reiniciar:
-        description: "Ignorar el avance anterior y comenzar de nuevo"
+        description: "Probar los cuatro SKU sin publicar"
         type: boolean
         default: false
-
+      reiniciar:
+        description: "Descartar avance y comenzar un ciclo nuevo"
+        type: boolean
+        default: false
   schedule:
-    # 5:00 a. m. de El Salvador
+    # 11:00 UTC = 5:00 a. m. de El Salvador
     - cron: "0 11 * * *"
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: vtex-catalogo
@@ -28,6 +27,22 @@ jobs:
   catalogo:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    env:
+      PYTHONUNBUFFERED: "1"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VTEX_ACCOUNT: siman
+      VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
+      VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
+      VTEX_SELLER_ID: "1"
+      MAX_WORKERS: "2"
+      REQUESTS_PER_SECOND: "2"
+      MAX_MINUTES: "220"
+      SC_SV: "1"
+      SC_GT: "4"
+      SC_NI: "15"
+      SC_CR: "2"
+      SOLO_PRUEBA: ${{ inputs.solo_prueba == true && 'true' || 'false' }}
+      REINICIAR: ${{ inputs.reiniciar == true && 'true' || 'false' }}
 
     steps:
       - name: Descargar repositorio
@@ -41,57 +56,26 @@ jobs:
       - name: Instalar dependencias
         run: python -m pip install "requests>=2.32,<3"
 
-      - name: Recuperar avance
-        if: ${{ inputs.reiniciar != true }}
-        uses: actions/cache/restore@v4
-        with:
-          path: .vtex-state
-          key: >-
-            ${{ runner.os }}-vtex-siman-v4-${{ hashFiles('main.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            ${{ runner.os }}-vtex-siman-v4-${{ hashFiles('main.py') }}-
+      - name: Validar sintaxis
+        run: python -m py_compile main.py
 
       - name: Ejecutar catalogo
         id: extraccion
-        env:
-          PYTHONUNBUFFERED: "1"
-
-          VTEX_ACCOUNT: siman
-          VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
-          VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
-          VTEX_SELLER_ID: "1"
-
-          MAX_WORKERS: "2"
-          REQUESTS_PER_SECOND: "2"
-          MAX_MINUTES: "240"
-
-          SC_SV: "1"
-          SC_CR: "2"
-          SC_NI: "15"
-          SC_GT: "4"
-
-          SOLO_PRUEBA: ${{ inputs.solo_prueba == true && 'true' || 'false' }}
-
         run: python main.py
 
-      - name: Guardar avance
-        if: ${{ always() && hashFiles('.vtex-state/checkpoint.sqlite') != '' }}
-        uses: actions/cache/save@v4
-        with:
-          path: .vtex-state
-          key: >-
-            ${{ runner.os }}-vtex-siman-v4-${{ hashFiles('main.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Guardar CSV de revisión
-        if: always()
+      - name: Guardar CSV
+        if: ${{ always() && hashFiles('catalogo_CAM.csv') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: catalogo_CAM
           path: catalogo_CAM.csv
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
+          compression-level: 6
 
-      - name: Actualizar Release
+      # Se publica el mismo nombre y tag que consume Power BI.
+      # Una vista previa nunca pasa esta condición.
+      - name: Reemplazar CSV del Release latest
         if: ${{ success() && steps.extraccion.outputs.publicar == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
@@ -101,3 +85,20 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Confirmar publicacion
+        if: ${{ success() && steps.extraccion.outputs.publicar == 'true' }}
+        run: python main.py --confirmar-publicacion
+
+      # Guarda el avance después de la publicación o de una pausa/error.
+      # El Python lo descarga automáticamente en la próxima ejecución.
+      - name: Guardar avance interno
+        if: ${{ always() && inputs.solo_prueba != true && hashFiles('.vtex-state/checkpoint.sqlite') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtex-estado-produccion-v1
+          path: .vtex-state/checkpoint.sqlite
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
