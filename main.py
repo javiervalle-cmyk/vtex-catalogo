@@ -5,6 +5,7 @@ import time
 
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
 import requests
 
@@ -16,7 +17,6 @@ import requests
 ACCOUNT = os.getenv("VTEX_ACCOUNT", "siman").strip()
 APP_KEY = os.getenv("VTEX_APP_KEY", "").strip()
 APP_TOKEN = os.getenv("VTEX_APP_TOKEN", "").strip()
-
 SELLER_ID = os.getenv("VTEX_SELLER_ID", "1").strip()
 
 SOLO_PRUEBA = (
@@ -32,7 +32,6 @@ BASE = f"https://{ACCOUNT}.vtexcommercestable.com.br"
 
 ARCHIVO = "catalogo_CAM.csv"
 MAX_REINTENTOS = 4
-MAX_SKU_PRUEBA = 3
 
 PAISES = {
     "SV": {
@@ -45,13 +44,28 @@ PAISES = {
     },
     "NI": {
         "url": "https://ni.siman.com",
-        "sc": os.getenv("SC_NI", "3").strip(),
+        "sc": os.getenv("SC_NI", "15").strip(),
     },
     "CR": {
         "url": "https://cr.siman.com",
         "sc": os.getenv("SC_CR", "2").strip(),
     },
 }
+
+MUESTRAS = [
+    {
+        "referencia": "105062291",
+        "pais_esperado": "SV",
+    },
+    {
+        "referencia": "104631517",
+        "pais_esperado": "NI",
+    },
+    {
+        "referencia": "105360348",
+        "pais_esperado": "SV",
+    },
+]
 
 COLUMNAS = [
     # Columnas originales
@@ -73,7 +87,7 @@ COLUMNAS = [
     "link",
     "imagen_url",
 
-    # Columnas adicionales
+    # Columnas existentes de auditoría
     "cuenta",
     "seller_id",
     "seller_vinculo_activo",
@@ -103,6 +117,10 @@ COLUMNAS = [
     "error_inventario",
     "error_contexto",
     "diagnostico",
+
+    # Nueva columna
+    "analisis",
+
     "fecha_extraccion_utc",
     "fecha_inicio_ciclo_utc",
     "fecha_fin_exportacion_utc",
@@ -172,20 +190,16 @@ def texto_seguro(valor):
             texto = texto.replace(secreto, "[OCULTO]")
 
     return (
-        texto
-        .replace("\r", " ")
-        .replace("\n", " ")
+        texto.replace("\r", " ").replace("\n", " ")
     )[:1000]
 
 
 def limitar_solicitudes():
     global ULTIMA_SOLICITUD
 
-    intervalo = 1 / RPS
-
     espera = (
         ULTIMA_SOLICITUD
-        + intervalo
+        + 1 / RPS
         - time.monotonic()
     )
 
@@ -243,7 +257,6 @@ def obtener_json(url, privada=False, params=None):
 
             status = respuesta.status_code
 
-            # La búsqueda pública puede devolver HTTP 206.
             aceptada = (
                 status == 200
                 or (not privada and status == 206)
@@ -319,14 +332,8 @@ def salida_github(nombre, valor):
     ruta = os.getenv("GITHUB_OUTPUT")
 
     if ruta:
-        with open(
-            ruta,
-            "a",
-            encoding="utf-8",
-        ) as archivo:
-            archivo.write(
-                f"{nombre}={valor}\n"
-            )
+        with open(ruta, "a", encoding="utf-8") as archivo:
+            archivo.write(f"{nombre}={valor}\n")
 
 
 # ============================================================
@@ -381,8 +388,7 @@ def cargar_politicas():
 
         if sc not in politicas:
             raise ErrorAPI(
-                f"No existe la política {sc} "
-                f"configurada para {pais}."
+                f"No existe la política {sc} para {pais}."
             )
 
         politica = politicas[sc]
@@ -398,27 +404,10 @@ def cargar_politicas():
 
 
 # ============================================================
-# MUESTRA DE HASTA TRES SKU PROPIOS
+# RESOLUCIÓN DE LAS TRES REFERENCIAS
 # ============================================================
 
 def cargar_muestra():
-    from urllib.parse import quote
-
-    muestras_conocidas = [
-        {
-            "referencia": "105062291",
-            "pais_esperado": "SV",
-        },
-        {
-            "referencia": "104631517",
-            "pais_esperado": "NI",
-        },
-        {
-            "referencia": "105360348",
-            "pais_esperado": "SV",
-        },
-    ]
-
     muestra = []
     errores = []
 
@@ -428,7 +417,7 @@ def cargar_muestra():
         flush=True,
     )
 
-    for registro in muestras_conocidas:
+    for registro in MUESTRAS:
         referencia = registro["referencia"]
         pais = registro["pais_esperado"]
 
@@ -452,8 +441,7 @@ def cargar_muestra():
 
             if not sku_id.isdigit():
                 raise ErrorAPI(
-                    "La consulta por referencia no devolvió "
-                    "un ID interno válido."
+                    "La referencia no devolvió un ID válido."
                 )
 
             contexto = validar_objeto(
@@ -487,7 +475,7 @@ def cargar_muestra():
             if propio is None:
                 raise ErrorAPI(
                     f"No se confirmó el seller {SELLER_ID} "
-                    f"para el SKU interno {sku_id}."
+                    f"para el SKU {sku_id}."
                 )
 
             print(
@@ -539,9 +527,7 @@ def cargar_producto(product_id):
         return CACHE_PRODUCTOS[clave]
 
     producto = validar_objeto(
-        api(
-            f"/api/catalog/pvt/product/{clave}"
-        ),
+        api(f"/api/catalog/pvt/product/{clave}"),
         f"producto {clave}",
     )
 
@@ -565,9 +551,7 @@ def cargar_producto(product_id):
                 f"Política sin StoreId para producto {clave}."
             )
 
-        politicas.add(
-            str(politica["StoreId"])
-        )
+        politicas.add(str(politica["StoreId"]))
 
     CACHE_PRODUCTOS[clave] = (
         producto,
@@ -578,7 +562,7 @@ def cargar_producto(product_id):
 
 
 # ============================================================
-# INVENTARIO
+# INVENTARIO POR BODEGA
 # ============================================================
 
 def cargar_inventario(sku_id):
@@ -604,17 +588,9 @@ def cargar_inventario(sku_id):
                 f"Balance inválido para SKU {sku_id}."
             )
 
-        total = numero(
-            balance.get("totalQuantity")
-        )
-
-        reservado = numero(
-            balance.get("reservedQuantity")
-        )
-
-        ilimitado = balance.get(
-            "hasUnlimitedQuantity"
-        )
+        total = numero(balance.get("totalQuantity"))
+        reservado = numero(balance.get("reservedQuantity"))
+        ilimitado = balance.get("hasUnlimitedQuantity")
 
         disponible = None
 
@@ -642,10 +618,7 @@ def cargar_inventario(sku_id):
 # ============================================================
 
 def buscar_producto(pais, product_id):
-    clave = (
-        pais,
-        str(product_id),
-    )
+    clave = (pais, str(product_id))
 
     if clave in CACHE_BUSQUEDAS:
         return CACHE_BUSQUEDAS[clave]
@@ -654,11 +627,8 @@ def buscar_producto(pais, product_id):
     errores = []
     fuente = ""
 
-    # Ambas consultas mantienen exactamente el mismo sc.
-    for dominio in (
-        config["url"],
-        BASE,
-    ):
+    # Ambas rutas conservan la misma política comercial.
+    for dominio in (config["url"], BASE):
         fuente = (
             dominio
             + "/api/catalog_system/pub/products/search"
@@ -714,11 +684,8 @@ def buscar_producto(pais, product_id):
             return resultado
 
         except ErrorAPI as exc:
-            errores.append(
-                texto_seguro(exc)
-            )
+            errores.append(texto_seguro(exc))
 
-            # Solo prueba otra ruta ante HTTP 400 o 404.
             if exc.status not in (400, 404):
                 break
 
@@ -740,7 +707,87 @@ def buscar_producto(pais, product_id):
 
 
 # ============================================================
-# PROCESAMIENTO
+# NUEVA COLUMNA: ANALISIS
+# ============================================================
+
+def generar_analisis(
+    sku,
+    producto,
+    asociado_politica,
+    politica_activa,
+    consulta_correcta,
+    item,
+    seller,
+    oferta,
+    error_inventario,
+):
+    """
+    Devuelve el primer hallazgo según este orden.
+
+    La ausencia en búsqueda no se atribuye automáticamente
+    a Janis, stock de seguridad ni falta de inventario.
+    """
+
+    if sku.get("IsActive") is False:
+        return "SKU INACTIVO"
+
+    if producto.get("IsActive") is False:
+        return "PRODUCTO INACTIVO"
+
+    if producto.get("IsVisible") is False:
+        return "PRODUCTO NO VISIBLE EN CONFIGURACION"
+
+    if not asociado_politica:
+        return "SIN POLITICA COMERCIAL WEB DEL PAIS"
+
+    if politica_activa is False:
+        return "POLITICA COMERCIAL DEL PAIS INACTIVA"
+
+    if not consulta_correcta:
+        return "ERROR DE CONSULTA PUBLICA"
+
+    if item is None:
+        return (
+            "NO APARECE EN BUSQUEDA: "
+            "REVISAR PRECIO, LOGISTICA E INDEXACION"
+        )
+
+    if seller is None:
+        return "SIN OFERTA SIMAN EN LA RESPUESTA"
+
+    cantidad = numero(oferta.get("AvailableQuantity"))
+    precio = numero(oferta.get("Price"))
+
+    if cantidad is not None and cantidad <= 0:
+        return "SIN STOCK EN LA OFERTA DEL PAIS"
+
+    if precio is not None and precio <= 0:
+        return "PRECIO CERO EN LA OFERTA DEL PAIS"
+
+    if error_inventario:
+        return "REVISAR INVENTARIO: ERROR DE CONSULTA"
+
+    if (
+        oferta.get("IsAvailable") is True
+        and cantidad is not None
+        and cantidad > 0
+    ):
+        return "OK"
+
+    if (
+        oferta.get("IsAvailable") is None
+        or cantidad is None
+    ):
+        return "DATOS DE OFERTA INCOMPLETOS"
+
+    return (
+        "OFERTA NO DISPONIBLE: "
+        "REVISAR REGLAS COMERCIALES Y LOGISTICA"
+    )
+
+
+# ============================================================
+# PROCESAMIENTO DE CADA SKU
 # ============================================================
 
 def procesar_sku(muestra, politicas_catalogo):
@@ -762,16 +809,12 @@ def procesar_sku(muestra, politicas_catalogo):
             f"SKU {sku_id} sin ProductId."
         )
 
-    producto, politicas = cargar_producto(
-        product_id
-    )
+    producto, politicas = cargar_producto(product_id)
 
     error_inventario = ""
 
     try:
-        bodegas = cargar_inventario(
-            sku_id
-        )
+        bodegas = cargar_inventario(sku_id)
 
     except ErrorAPI as exc:
         bodegas = None
@@ -780,21 +823,17 @@ def procesar_sku(muestra, politicas_catalogo):
     ids_politicas = sorted(
         politicas,
         key=lambda valor: (
-            0,
-            int(valor),
+            0, int(valor)
         ) if valor.isdigit() else (
-            1,
-            valor,
+            1, valor
         ),
     )
 
     nombres_politicas = [
         politicas_catalogo.get(
-            politica_id,
-            {},
+            politica_id, {}
         ).get(
-            "Name",
-            f"ID {politica_id}",
+            "Name", f"ID {politica_id}"
         )
         for politica_id in ids_politicas
     ]
@@ -819,10 +858,7 @@ def procesar_sku(muestra, politicas_catalogo):
             product_id,
         )
 
-        item = resultado["items"].get(
-            sku_id
-        )
-
+        item = resultado["items"].get(sku_id)
         seller = None
         oferta = {}
 
@@ -830,21 +866,14 @@ def procesar_sku(muestra, politicas_catalogo):
             seller = next(
                 (
                     vendedor
-                    for vendedor in (
-                        item.get("sellers") or []
-                    )
-                    if str(
-                        vendedor.get("sellerId")
-                    ) == SELLER_ID
+                    for vendedor in item.get("sellers") or []
+                    if str(vendedor.get("sellerId")) == SELLER_ID
                 ),
                 None,
             )
 
             if seller is not None:
-                oferta = (
-                    seller.get("commertialOffer")
-                    or {}
-                )
+                oferta = seller.get("commertialOffer") or {}
 
         cantidad = numero(
             oferta.get("AvailableQuantity")
@@ -872,10 +901,7 @@ def procesar_sku(muestra, politicas_catalogo):
             compra = "N"
             estado = "SIN_OFERTA_SIMAN"
 
-        elif (
-            disponible is None
-            or cantidad is None
-        ):
+        elif disponible is None or cantidad is None:
             aparece = "Y"
             compra = "DESCONOCIDO"
             estado = "DISPONIBILIDAD_DESCONOCIDA"
@@ -897,48 +923,46 @@ def procesar_sku(muestra, politicas_catalogo):
 
         sc = config["sc"]
         politica = politicas_catalogo[sc]
+        asociado = sc in politicas
 
+        # Diagnóstico existente: puede contener varios hallazgos.
         hallazgos = []
 
         if sku.get("IsActive") is False:
-            hallazgos.append(
-                "SKU_INACTIVO"
-            )
+            hallazgos.append("SKU_INACTIVO")
 
         if producto.get("IsActive") is False:
-            hallazgos.append(
-                "PRODUCTO_INACTIVO"
-            )
+            hallazgos.append("PRODUCTO_INACTIVO")
 
         if producto.get("IsVisible") is False:
-            hallazgos.append(
-                "PRODUCTO_NO_VISIBLE_CONFIG"
-            )
+            hallazgos.append("PRODUCTO_NO_VISIBLE_CONFIG")
 
-        if sc not in politicas:
-            hallazgos.append(
-                "SIN_POLITICA_DEL_PAIS"
-            )
+        if not asociado:
+            hallazgos.append("SIN_POLITICA_DEL_PAIS")
 
         if politica.get("IsActive") is False:
-            hallazgos.append(
-                "POLITICA_INACTIVA"
-            )
+            hallazgos.append("POLITICA_INACTIVA")
 
         if error_inventario:
-            hallazgos.append(
-                "ERROR_CONSULTA_INVENTARIO"
-            )
+            hallazgos.append("ERROR_CONSULTA_INVENTARIO")
 
         hallazgos.append(estado)
 
-        if (
-            cantidad is not None
-            and cantidad <= 0
-        ):
-            hallazgos.append(
-                "SIN_STOCK_EN_OFERTA"
-            )
+        if cantidad is not None and cantidad <= 0:
+            hallazgos.append("SIN_STOCK_EN_OFERTA")
+
+        # Nueva columna: primer hallazgo de la cascada.
+        analisis = generar_analisis(
+            sku=sku,
+            producto=producto,
+            asociado_politica=asociado,
+            politica_activa=politica.get("IsActive"),
+            consulta_correcta=resultado["ok"],
+            item=item,
+            seller=seller,
+            oferta=oferta,
+            error_inventario=error_inventario,
+        )
 
         ruta = contexto.get("DetailUrl")
 
@@ -955,11 +979,7 @@ def procesar_sku(muestra, politicas_catalogo):
             link = (
                 ruta
                 if ruta.startswith("http")
-                else (
-                    config["url"]
-                    + "/"
-                    + ruta.lstrip("/")
-                )
+                else config["url"] + "/" + ruta.lstrip("/")
             )
 
         fila = {
@@ -972,7 +992,7 @@ def procesar_sku(muestra, politicas_catalogo):
             "variante": sku.get("Name"),
 
             # Conserva el significado del archivo original:
-            # disponibilidad de la oferta, no IsVisible.
+            # disponibilidad de oferta, no IsVisible.
             "visible": compra,
             "estado": estado,
             "stock_sku": cantidad,
@@ -1018,21 +1038,15 @@ def procesar_sku(muestra, politicas_catalogo):
             "disponible_compra": compra,
 
             "politica_consultada_id": sc,
-            "politica_consultada_nombre": politica.get(
-                "Name"
-            ),
+            "politica_consultada_nombre": politica.get("Name"),
             "politica_consultada_activa": bandera(
                 politica.get("IsActive")
             ),
             "asociado_politica_pais": (
-                "Y" if sc in politicas else "N"
+                "Y" if asociado else "N"
             ),
-            "politicas_ids": "|".join(
-                ids_politicas
-            ),
-            "politicas_nombres": "|".join(
-                nombres_politicas
-            ),
+            "politicas_ids": "|".join(ids_politicas),
+            "politicas_nombres": "|".join(nombres_politicas),
 
             **{
                 f"politica_{codigo.lower()}": (
@@ -1063,23 +1077,21 @@ def procesar_sku(muestra, politicas_catalogo):
             "error_inventario": error_inventario,
             "error_contexto": "",
             "diagnostico": " | ".join(hallazgos),
+            "analisis": analisis,
+
             "fecha_extraccion_utc": ahora(),
             "fecha_inicio_ciclo_utc": FECHA_INICIO,
-
-            # Es una muestra, nunca un catálogo completo.
             "extraccion_completa": "N",
         }
 
         filas.append(fila)
 
         print(
-            f"PRUEBA SKU={sku_id}; "
+            f"PRUEBA ref_sku={sku.get('RefId')}; "
+            f"sku_id={sku_id}; "
             f"pais={pais}; "
-            f"politica={sc}; "
-            f"politica_activa="
-            f"{bandera(politica.get('IsActive'))}; "
             f"estado={estado}; "
-            f"fuente={resultado['fuente']}",
+            f"analisis={analisis}",
             flush=True,
         )
 
@@ -1113,10 +1125,7 @@ def guardar_csv(filas):
             fila["fecha_fin_exportacion_utc"] = fecha_fin
             escritor.writerow(fila)
 
-    os.replace(
-        temporal,
-        ARCHIVO,
-    )
+    os.replace(temporal, ARCHIVO)
 
 
 # ============================================================
@@ -1124,11 +1133,8 @@ def guardar_csv(filas):
 # ============================================================
 
 def main():
-    # Esta prueba nunca publica sobre el release latest.
-    salida_github(
-        "publicar",
-        "false",
-    )
+    # Esta prueba nunca reemplaza el release latest.
+    salida_github("publicar", "false")
 
     filas = []
     errores = []
@@ -1146,8 +1152,7 @@ def main():
 
         if not APP_KEY or not APP_TOKEN:
             raise RuntimeError(
-                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN "
-                "en las variables de entorno."
+                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN."
             )
 
         print(
@@ -1160,7 +1165,6 @@ def main():
 
         politicas_catalogo = cargar_politicas()
         muestra = cargar_muestra()
-
         sku_muestra = len(muestra)
 
         print(
@@ -1177,14 +1181,8 @@ def main():
                     politicas_catalogo,
                 )
 
-                filas.extend(
-                    nuevas_filas
-                )
-
-                errores.extend(
-                    nuevos_errores
-                )
-
+                filas.extend(nuevas_filas)
+                errores.extend(nuevos_errores)
                 sku_con_filas += 1
 
             except Exception as exc:
@@ -1202,7 +1200,6 @@ def main():
 
     except Exception as exc:
         fallo_general = True
-
         detalle = texto_seguro(exc)
         errores.append(detalle)
 
@@ -1240,14 +1237,14 @@ def main():
 
     if fallo_general or errores:
         raise SystemExit(
-            "La prueba encontró errores. "
-            "Revisa el listado de políticas y los mensajes "
-            "ERROR PUBLICO. El CSV publicado no se modifica."
+            "La prueba encontró errores. Revisa el registro. "
+            "El CSV publicado no se modifica."
         )
 
     print(
         "Prueba terminada sin errores de consulta. "
-        "El CSV de muestra está disponible en el artefacto. "
+        "El CSV incluye la columna analisis y está disponible "
+        "en el artefacto catalogo_CAM. "
         "No se actualiza el release latest.",
         flush=True,
     )
