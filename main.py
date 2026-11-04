@@ -476,114 +476,120 @@ def preparar_ciclo(db):
 # ============================================================
 
 def cargar_sku_siman(db):
-    if leer_meta(db, "listado_completo") == "1":
-        total = db.execute(
-            "SELECT COUNT(*) FROM sku"
-        ).fetchone()[0]
-
-        print(
-            f"Reanudando listado guardado: {total} SKU.",
-            flush=True,
-        )
-        return
-
-    ruta = (
-        "/api/sku-binding/pvt/skuseller/list/"
-        f"bysellerId/{SELLER_ID}"
-    )
-
-    print(
-        f"Consultando vínculos del seller {SELLER_ID}...",
-        flush=True,
-    )
-
-    print(
-        f"DIAGNOSTICO SELLER: endpoint={BASE + ruta}",
-        flush=True,
-    )
-
-    bindings = api(ruta)
-
-    print(
-        "DIAGNOSTICO SELLER: "
-        f"tipo={type(bindings).__name__}",
-        flush=True,
-    )
-
-    if isinstance(bindings, list):
-        print(
-            "DIAGNOSTICO SELLER: "
-            f"registros={len(bindings)}",
-            flush=True,
-        )
-
-        if not bindings:
-            raise ErrorAPI(
-                f"VTEX devolvió una lista vacía para el seller "
-                f"{SELLER_ID}. Este endpoint no proporciona "
-                "un listado utilizable de productos propios "
-                "en esta consulta. No se publicará el CSV."
-            )
-
-        primero = bindings[0]
-
-        print(
-            "DIAGNOSTICO SELLER: campos del primer registro="
-            + str(
-                list(primero.keys())
-                if isinstance(primero, dict)
-                else type(primero).__name__
-            ),
-            flush=True,
-        )
-
-    else:
-        print(
-            "DIAGNOSTICO SELLER: campos de respuesta="
-            + str(
-                list(bindings.keys())
-                if isinstance(bindings, dict)
-                else "No es un objeto ni una lista"
-            ),
-            flush=True,
-        )
-
+    # Esta versión es únicamente una prueba controlada.
+    # Impide iniciar un recorrido masivo accidentalmente.
+    if not SOLO_PRUEBA:
         raise ErrorAPI(
-            "El endpoint devolvió una estructura distinta "
-            "a la lista esperada. No se publicará el CSV."
+            "Esta versión requiere solo_prueba=true. "
+            "Primero debemos validar la consulta de muestra."
         )
+
+    print(
+        "PRUEBA: consultando únicamente 3 ID "
+        "del catálogo administrativo.",
+        flush=True,
+    )
+
+    ids = api(
+        "/api/catalog_system/pvt/sku/stockkeepingunitids",
+        params={
+            "page": 1,
+            "pagesize": 3,
+        },
+    )
+
+    if not isinstance(ids, list) or not ids:
+        raise ErrorAPI(
+            "El catálogo administrativo no devolvió "
+            "una lista válida de ID."
+        )
+
+    # Aunque el servicio devolviera más resultados,
+    # esta prueba nunca procesa más de tres.
+    ids = ids[:3]
+
+    print(
+        f"PRUEBA: ID recibidos={ids}",
+        flush=True,
+    )
 
     registros = {}
 
-    for binding in bindings:
-        if not isinstance(binding, dict):
-            raise ErrorAPI(
-                "Vínculo de seller inválido."
-            )
-
-        if str(binding.get("SellerId")) != SELLER_ID:
-            raise ErrorAPI(
-                "La API devolvió un seller distinto "
-                "al solicitado."
-            )
-
-        sku_id = str(
-            binding.get("StockKeepingUnitId", "")
-        )
+    for valor in ids:
+        sku_id = str(valor)
 
         if not sku_id.isdigit():
             raise ErrorAPI(
-                "Un vínculo no contiene "
-                "StockKeepingUnitId válido."
+                "El listado contiene un ID inválido."
             )
 
-        # También conserva los vínculos inactivos.
-        registros[sku_id] = binding
+        contexto = objeto(
+            api(
+                "/api/catalog_system/pvt/sku/"
+                f"stockkeepingunitbyid/{sku_id}"
+            ),
+            f"contexto de prueba {sku_id}",
+        )
+
+        sellers = contexto.get("SkuSellers") or []
+
+        if not isinstance(sellers, list):
+            raise ErrorAPI(
+                f"SkuSellers tiene un formato inesperado "
+                f"para el SKU {sku_id}."
+            )
+
+        sellers_ids = [
+            str(seller.get("SellerId"))
+            for seller in sellers
+            if isinstance(seller, dict)
+        ]
+
+        print(
+            f"PRUEBA SKU={sku_id}; "
+            f"sellers={sellers_ids}",
+            flush=True,
+        )
+
+        propio = next(
+            (
+                seller
+                for seller in sellers
+                if (
+                    isinstance(seller, dict)
+                    and str(seller.get("SellerId"))
+                    == SELLER_ID
+                )
+            ),
+            None,
+        )
+
+        if propio is not None:
+            # No exige IsActive=True:
+            # también necesitamos los propios inactivos.
+            registros[sku_id] = propio
+
+    if not registros:
+        raise ErrorAPI(
+            "Ninguno de los tres SKU de muestra tiene "
+            "un vínculo confirmado con el seller de Siman. "
+            "Necesitamos probar con un ID interno de VTEX "
+            "de un producto propio conocido."
+        )
 
     with db:
+        # Reinicia únicamente la muestra de diagnóstico.
+        # La extracción completa está bloqueada arriba.
+        db.execute("DELETE FROM sku")
+
+        db.execute(
+            "DELETE FROM meta "
+            "WHERE clave IN ('listado_completo', 'completo')"
+        )
+
         db.executemany(
             """
-            INSERT OR IGNORE INTO sku (id, binding)
+            INSERT INTO sku (id, binding)
             VALUES (?, ?)
             """,
             (
@@ -598,17 +604,11 @@ def cargar_sku_siman(db):
             ),
         )
 
-        escribir_meta(
-            db,
-            "listado_completo",
-            "1",
-        )
-
     print(
-        f"SKU vinculados a Siman: {len(registros)}",
+        f"PRUEBA: {len(registros)} SKU propios confirmados. "
+        "Se consultarán sus datos en los cuatro países.",
         flush=True,
     )
-
 
 # ============================================================
 # DATOS ADMINISTRATIVOS
