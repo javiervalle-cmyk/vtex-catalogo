@@ -1,18 +1,19 @@
-import os
+import csv
+import hashlib
 import json
-import time
+import os
 import random
+import sqlite3
 import threading
+import time
+import uuid
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    Future,
-    as_completed,
-)
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
+from pathlib import Path
 
-import pandas as pd
 import requests
 
 
@@ -23,22 +24,32 @@ import requests
 ACCOUNT = os.getenv("VTEX_ACCOUNT", "siman").strip()
 APP_KEY = os.getenv("VTEX_APP_KEY", "").strip()
 APP_TOKEN = os.getenv("VTEX_APP_TOKEN", "").strip()
-
 SELLER_ID = os.getenv("VTEX_SELLER_ID", "1").strip()
 
-MAX_WORKERS = max(
+WORKERS = max(
     1,
-    min(int(os.getenv("MAX_WORKERS", "6")), 12),
+    min(int(os.getenv("MAX_WORKERS", "2")), 4),
 )
 
-PAGE_SIZE = 1000
-MAX_REINTENTOS = 5
-
-BASE_PRIVADA = (
-    f"https://{ACCOUNT}.vtexcommercestable.com.br"
+RPS = max(
+    0.1,
+    min(float(os.getenv("REQUESTS_PER_SECOND", "2")), 5),
 )
 
-# Políticas comerciales según tu captura.
+MINUTOS = max(
+    1,
+    min(int(os.getenv("MAX_MINUTES", "240")), 270),
+)
+
+SOLO_PRUEBA = (
+    os.getenv("SOLO_PRUEBA", "false").lower() == "true"
+)
+
+MAX_REINTENTOS = 4
+MAX_ERRORES_PAIS = 3
+
+BASE = f"https://{ACCOUNT}.vtexcommercestable.com.br"
+
 PAISES = {
     "SV": {
         "url": "https://sv.siman.com",
@@ -58,12 +69,14 @@ PAISES = {
     },
 }
 
-FECHA_INICIO = datetime.now(timezone.utc).isoformat()
+ARCHIVO = "catalogo_CAM.csv"
+ESTADO = Path(".vtex-state/checkpoint.sqlite")
 
-ARCHIVO_SALIDA = "catalogo_CAM.csv"
+RUN_ID = uuid.uuid4().hex
+DEADLINE = time.monotonic() + MINUTOS * 60
 
-# Las columnas originales se mantienen al inicio.
 COLUMNAS = [
+    # Columnas originales
     "pais",
     "productReference",
     "productId",
@@ -82,7 +95,7 @@ COLUMNAS = [
     "link",
     "imagen_url",
 
-    # Nuevas columnas
+    # Columnas adicionales
     "cuenta",
     "seller_id",
     "seller_vinculo_activo",
@@ -90,8 +103,6 @@ COLUMNAS = [
     "producto_activo",
     "producto_visible_config",
     "mostrar_sin_stock",
-    "marca_activa",
-    "categoria_activa",
     "categoria_id",
     "categorias",
     "rutas_categorias",
@@ -109,36 +120,56 @@ COLUMNAS = [
     "politica_cr",
     "cantidad_bodegas",
     "inventario_bodegas_json",
+    "fuente_busqueda",
+    "error_busqueda",
+    "error_inventario",
+    "error_contexto",
     "diagnostico",
     "fecha_extraccion_utc",
-    "fecha_fin_extraccion_utc",
+    "fecha_inicio_ciclo_utc",
+    "fecha_fin_exportacion_utc",
     "extraccion_completa",
 ]
 
-_local = threading.local()
+LOCAL = threading.local()
+LOCK_RATE = threading.Lock()
+LOCK_PAIS = threading.Lock()
 
-_cache_productos = {}
-_lock_productos = threading.Lock()
+PROXIMA_SOLICITUD = 0.0
+
+CIRCUITOS = {
+    pais: {
+        "errores": 0,
+        "abierto": False,
+        "ruta": config["url"],
+    }
+    for pais, config in PAISES.items()
+}
 
 
 # ============================================================
 # UTILIDADES
 # ============================================================
 
-class ErrorConsulta(RuntimeError):
+class PausaExtraccion(RuntimeError):
     pass
 
 
+class ErrorAPI(RuntimeError):
+    def __init__(self, mensaje, status=None):
+        super().__init__(mensaje)
+        self.status = status
+
+
+def ahora():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def bandera(valor):
-    """
-    No convierte información desconocida en N.
-    """
     if valor is True:
         return "Y"
-
     if valor is False:
         return "N"
-
     return "DESCONOCIDO"
 
 
@@ -152,455 +183,417 @@ def numero(valor):
         return None
 
 
-def ordenar_ids(valores):
-    return sorted(
-        valores,
-        key=lambda valor: (
-            0,
-            int(valor),
-        ) if str(valor).isdigit() else (
-            1,
-            str(valor),
-        ),
-    )
+def texto_seguro(valor):
+    texto = str(valor)
+
+    for secreto in (APP_KEY, APP_TOKEN):
+        if secreto:
+            texto = texto.replace(secreto, "[OCULTO]")
+
+    return texto.replace("\r", " ").replace("\n", " ")[:700]
+
+
+def revisar_tiempo():
+    if time.monotonic() >= DEADLINE:
+        raise PausaExtraccion(
+            "Se alcanzó el tiempo de esta ejecución."
+        )
+
+
+def esperar(segundos):
+    segundos = max(0, segundos)
+
+    if time.monotonic() + segundos >= DEADLINE:
+        raise PausaExtraccion(
+            "Se guardará el avance antes de seguir esperando."
+        )
+
+    time.sleep(segundos)
+
+
+def limitar_solicitudes():
+    global PROXIMA_SOLICITUD
+
+    revisar_tiempo()
+
+    with LOCK_RATE:
+        instante = max(
+            time.monotonic(),
+            PROXIMA_SOLICITUD,
+        )
+
+        PROXIMA_SOLICITUD = instante + 1 / RPS
+
+    esperar(max(0, instante - time.monotonic()))
+    revisar_tiempo()
 
 
 def sesion(privada):
-    """
-    Crea una sesión por hilo.
-
-    Las credenciales solo se utilizan en consultas privadas.
-    """
     nombre = "privada" if privada else "publica"
 
-    if not hasattr(_local, nombre):
-        nueva_sesion = requests.Session()
+    if not hasattr(LOCAL, nombre):
+        s = requests.Session()
 
-        nueva_sesion.headers.update({
+        s.headers.update({
             "Accept": "application/json",
-            "User-Agent": "Siman-Catalogo-Auditoria/1.0",
+            "User-Agent": "Siman-Catalogo-Auditoria/4.0",
         })
 
         if privada:
-            nueva_sesion.headers.update({
+            s.headers.update({
                 "X-VTEX-API-AppKey": APP_KEY,
                 "X-VTEX-API-AppToken": APP_TOKEN,
             })
 
-        setattr(
-            _local,
-            nombre,
-            nueva_sesion,
-        )
+        setattr(LOCAL, nombre, s)
 
-    return getattr(_local, nombre)
+    return getattr(LOCAL, nombre)
 
 
-def espera_reintento(respuesta, intento):
-    if respuesta is not None:
-        valor = respuesta.headers.get("Retry-After")
+def retry_after(respuesta, intento):
+    valor = (
+        respuesta.headers.get("Retry-After")
+        if respuesta is not None
+        else None
+    )
 
-        if valor:
+    if valor:
+        try:
+            return max(0, float(valor))
+        except ValueError:
             try:
                 return max(
                     0,
-                    float(valor),
+                    parsedate_to_datetime(valor).timestamp()
+                    - time.time(),
                 )
+            except (ValueError, TypeError, OverflowError):
+                pass
 
-            except ValueError:
-                try:
-                    fecha = parsedate_to_datetime(valor)
-
-                    return max(
-                        0,
-                        fecha.timestamp() - time.time(),
-                    )
-
-                except (
-                    ValueError,
-                    TypeError,
-                    OverflowError,
-                ):
-                    pass
-
-    return (
-        min(
-            60,
-            2 ** (intento + 1),
-        )
-        + random.random()
-    )
+    return min(60, 2 ** (intento + 1)) + random.random()
 
 
-def obtener_json(
-    url,
-    privada=False,
-    params=None,
-):
-    """
-    Reintenta:
-    - Errores de conexión.
-    - Timeout.
-    - JSON inválido.
-    - HTTP 408.
-    - HTTP 429.
-    - HTTP 5xx.
+def obtener_json(url, privada=False, params=None):
+    global PROXIMA_SOLICITUD
 
-    No imprime credenciales ni cuerpos de respuesta.
-    """
     for intento in range(MAX_REINTENTOS):
+        limitar_solicitudes()
         respuesta = None
+        status = None
 
         try:
             respuesta = sesion(privada).get(
                 url,
                 params=params,
-                timeout=(15, 60),
+                timeout=(15, 45),
                 allow_redirects=not privada,
             )
 
-            codigo = respuesta.status_code
+            status = respuesta.status_code
 
-            if codigo == 200:
+            if status == 200:
                 try:
                     return respuesta.json()
-
                 except ValueError:
-                    causa = "Respuesta JSON inválida"
-
-            elif codigo in (408, 429) or codigo >= 500:
-                causa = f"HTTP {codigo}"
+                    detalle = "La respuesta no contiene JSON válido."
 
             else:
-                raise ErrorConsulta(
-                    f"HTTP {codigo}: {url}"
+                detalle = (
+                    f"HTTP {status}; URL={respuesta.url}; "
+                    f"respuesta={texto_seguro(respuesta.text)}"
                 )
 
-        except requests.RequestException as exc:
-            causa = type(exc).__name__
+                # Los 400 no se repiten automáticamente.
+                if status not in (408, 429) and status < 500:
+                    raise ErrorAPI(detalle, status)
 
-        if intento == MAX_REINTENTOS - 1:
-            raise ErrorConsulta(
-                f"{causa}, agotados los reintentos: {url}"
+        except requests.RequestException as exc:
+            detalle = (
+                f"{type(exc).__name__}: "
+                f"{texto_seguro(exc)}"
             )
 
-        espera = espera_reintento(
-            respuesta,
-            intento,
-        )
+        if intento == MAX_REINTENTOS - 1:
+            raise ErrorAPI(detalle, status)
+
+        demora = retry_after(respuesta, intento)
+
+        if status == 429:
+            # Aplica la pausa a todos los hilos.
+            with LOCK_RATE:
+                PROXIMA_SOLICITUD = max(
+                    PROXIMA_SOLICITUD,
+                    time.monotonic() + demora,
+                )
 
         print(
-            f"Reintento {intento + 1}/"
-            f"{MAX_REINTENTOS}: "
-            f"{causa}; espera {espera:.1f}s",
+            f"Reintento {intento + 1}: "
+            f"{detalle}; espera={demora:.1f}s",
             flush=True,
         )
 
-        time.sleep(espera)
+        esperar(demora)
 
-    raise ErrorConsulta(
-        f"Consulta sin resultado: {url}"
-    )
+    raise ErrorAPI("Consulta sin resultado.")
 
 
 def api(ruta, params=None):
     return obtener_json(
-        BASE_PRIVADA + ruta,
+        BASE + ruta,
         privada=True,
         params=params,
     )
 
 
-def validar_objeto(valor, descripcion):
-    if (
-        not isinstance(valor, dict)
-        or not valor
-    ):
-        raise ErrorConsulta(
-            f"Respuesta inesperada: {descripcion}"
+def objeto(valor, nombre):
+    if not isinstance(valor, dict) or not valor:
+        raise ErrorAPI(
+            f"Respuesta inesperada para {nombre}."
         )
 
     return valor
 
 
-def guardar_catalogo(filas):
-    """
-    Genera únicamente catalogo_CAM.csv.
-    Mantiene las columnas incluso si no hay filas.
-    """
-    df = pd.DataFrame(
-        filas,
-        columns=COLUMNAS,
-    )
-
-    if not df.empty:
-        df.drop_duplicates(
-            subset=[
-                "pais",
-                "sku_id",
-            ],
-            inplace=True,
-        )
-
-        df.sort_values(
-            by=[
-                "pais",
-                "sku_id",
-            ],
-            inplace=True,
-        )
-
-    temporal = ARCHIVO_SALIDA + ".tmp"
-
-    df.to_csv(
-        temporal,
-        index=False,
-        sep=";",
-        encoding="utf-8-sig",
-    )
-
-    os.replace(
-        temporal,
-        ARCHIVO_SALIDA,
-    )
-
-    return len(df)
-
-
 # ============================================================
-# LISTADO COMPLETO DE SKU
+# ESTADO PARA REANUDAR
 # ============================================================
 
-def obtener_todos_los_sku():
-    ids = []
-    vistos = set()
-    pagina = 1
+def abrir_estado():
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
 
-    while True:
-        resultado = api(
-            "/api/catalog_system/pvt/sku/"
-            "stockkeepingunitids",
-            params={
-                "page": pagina,
-                "pagesize": PAGE_SIZE,
+    db = sqlite3.connect(ESTADO)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            clave TEXT PRIMARY KEY,
+            valor TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS sku (
+            id TEXT PRIMARY KEY,
+            binding TEXT NOT NULL,
+            estado INTEGER NOT NULL DEFAULT 0,
+            filas TEXT,
+            error TEXT,
+            ultima_ejecucion TEXT
+        )
+    """)
+
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sku_estado
+        ON sku (estado)
+    """)
+
+    db.commit()
+    return db
+
+
+def leer_meta(db, clave, defecto=None):
+    fila = db.execute(
+        "SELECT valor FROM meta WHERE clave = ?",
+        (clave,),
+    ).fetchone()
+
+    return fila[0] if fila else defecto
+
+
+def escribir_meta(db, clave, valor):
+    db.execute(
+        "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+        (clave, str(valor)),
+    )
+
+
+def preparar_ciclo(db):
+    firma = hashlib.sha256(
+        json.dumps(
+            {
+                "version": 4,
+                "cuenta": ACCOUNT,
+                "seller": SELLER_ID,
+                "paises": PAISES,
             },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+    anterior = leer_meta(db, "firma")
+
+    if anterior and anterior != firma:
+        raise RuntimeError(
+            "La configuración no coincide con el avance guardado. "
+            "Ejecuta el flujo con reiniciar=true."
         )
 
-        if not isinstance(resultado, list):
-            raise ErrorConsulta(
-                "El listado de SKU no devolvió una lista"
-            )
+    # Después de publicar un ciclo completo, comienza uno nuevo.
+    if leer_meta(db, "completo") == "1":
+        db.execute("DELETE FROM sku")
+        db.execute("DELETE FROM meta")
 
-        if not resultado:
-            break
+    escribir_meta(db, "firma", firma)
 
-        nuevos = []
+    if not leer_meta(db, "inicio"):
+        escribir_meta(db, "inicio", ahora())
 
-        for valor in resultado:
-            if (
-                valor is None
-                or isinstance(
-                    valor,
-                    (dict, list, bool),
-                )
-            ):
-                raise ErrorConsulta(
-                    "ID inesperado en el listado de SKU"
-                )
+    db.commit()
 
-            sku_id = str(valor)
 
-            if sku_id not in vistos:
-                vistos.add(sku_id)
-                nuevos.append(sku_id)
-
-        if not nuevos:
-            raise ErrorConsulta(
-                "La paginación repitió una página completa. "
-                "Se detuvo para evitar un catálogo incompleto."
-            )
-
-        ids.extend(nuevos)
+def cargar_sku_siman(db):
+    if leer_meta(db, "listado_completo") == "1":
+        total = db.execute(
+            "SELECT COUNT(*) FROM sku"
+        ).fetchone()[0]
 
         print(
-            f"Página {pagina}: "
-            f"{len(resultado)} IDs; "
-            f"acumulados {len(ids)}",
+            f"Reanudando listado guardado: {total} SKU.",
             flush=True,
         )
+        return
 
-        # Se continúa hasta recibir una página vacía.
-        # No existe un límite artificial de 2,500 productos.
-        pagina += 1
+    print(
+        f"Consultando vínculos del seller {SELLER_ID}...",
+        flush=True,
+    )
 
-    if not ids:
-        raise ErrorConsulta(
-            "VTEX devolvió un catálogo vacío"
+    bindings = api(
+        "/sku-binding/pvt/skuseller/list/"
+        f"bysellerId/{SELLER_ID}"
+    )
+
+    if not isinstance(bindings, list) or not bindings:
+        raise ErrorAPI(
+            "El listado del seller está vacío o tiene "
+            "un formato inesperado. No se publicará."
         )
 
-    return ids
+    registros = {}
+
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise ErrorAPI("Vínculo de seller inválido.")
+
+        if str(binding.get("SellerId")) != SELLER_ID:
+            raise ErrorAPI(
+                "La API devolvió un seller distinto al solicitado."
+            )
+
+        sku_id = str(binding.get("StockKeepingUnitId", ""))
+
+        if not sku_id.isdigit():
+            raise ErrorAPI(
+                "Un vínculo no contiene StockKeepingUnitId válido."
+            )
+
+        # No se filtra IsActive: necesitamos también los inactivos.
+        registros[sku_id] = binding
+
+    with db:
+        db.executemany(
+            "INSERT OR IGNORE INTO sku (id, binding) VALUES (?, ?)",
+            (
+                (
+                    sku_id,
+                    json.dumps(binding, ensure_ascii=False),
+                )
+                for sku_id, binding in registros.items()
+            ),
+        )
+
+        escribir_meta(db, "listado_completo", "1")
+
+    print(
+        f"SKU vinculados a Siman: {len(registros)}",
+        flush=True,
+    )
 
 
 # ============================================================
-# PRODUCTO, POLÍTICAS Y BÚSQUEDA POR PAÍS
+# DATOS ADMINISTRATIVOS
 # ============================================================
 
+@lru_cache(maxsize=4096)
 def cargar_producto(product_id):
-    producto = validar_objeto(
-        api(
-            f"/api/catalog/pvt/product/{product_id}"
-        ),
+    producto = objeto(
+        api(f"/api/catalog/pvt/product/{product_id}"),
         f"producto {product_id}",
     )
 
-    politicas = api(
-        f"/api/catalog/pvt/product/"
-        f"{product_id}/salespolicy"
+    resultado = api(
+        f"/api/catalog/pvt/product/{product_id}/salespolicy"
     )
 
-    if not isinstance(politicas, list):
-        raise ErrorConsulta(
-            f"Políticas inesperadas para {product_id}"
+    if not isinstance(resultado, list):
+        raise ErrorAPI(
+            f"Políticas inválidas para producto {product_id}."
         )
 
-    ids_politicas = set()
+    politicas = set()
 
-    for politica in politicas:
+    for politica in resultado:
         if (
             not isinstance(politica, dict)
             or politica.get("StoreId") is None
         ):
-            raise ErrorConsulta(
-                f"Política sin StoreId para {product_id}"
+            raise ErrorAPI(
+                f"Política sin StoreId: producto {product_id}."
             )
 
-        ids_politicas.add(
-            str(politica["StoreId"])
+        politicas.add(str(politica["StoreId"]))
+
+    return producto, politicas
+
+
+def cargar_contexto(sku_id):
+    try:
+        contexto = objeto(
+            api(
+                "/api/catalog_system/pvt/sku/"
+                f"stockkeepingunitbyid/{sku_id}"
+            ),
+            f"contexto {sku_id}",
         )
 
-    por_pais = {}
+        return contexto, ""
 
-    for pais, config in PAISES.items():
-        productos = obtener_json(
-            config["url"]
-            + "/api/catalog_system/pub/products/search",
-            params={
-                "fq": f"productId:{product_id}",
-                "sc": config["sc"],
-                "_from": 0,
-                "_to": 49,
-            },
-        )
+    except ErrorAPI as exc:
+        # No es necesario descartar un SKU administrativo
+        # porque su contexto indexado no esté disponible.
+        # Los errores de autorización sí deben corregirse.
+        if exc.status in (401, 403):
+            raise
 
-        if not isinstance(productos, list):
-            raise ErrorConsulta(
-                f"Búsqueda pública inesperada: "
-                f"{pais}, producto {product_id}"
-            )
-
-        items = {}
-
-        for encontrado in productos:
-            if not isinstance(encontrado, dict):
-                raise ErrorConsulta(
-                    f"Producto público inválido: "
-                    f"{pais}, producto {product_id}"
-                )
-
-            if (
-                str(encontrado.get("productId"))
-                != str(product_id)
-            ):
-                continue
-
-            for item in encontrado.get("items") or []:
-                item_id = item.get("itemId")
-
-                if item_id is not None:
-                    items[str(item_id)] = item
-
-        por_pais[pais] = items
-
-    return {
-        "producto": producto,
-        "politicas": ids_politicas,
-        "publico": por_pais,
-    }
+        return {}, texto_seguro(exc)
 
 
-def obtener_producto(product_id):
-    """
-    Comparte los datos del producto entre sus SKU.
-
-    Evita consultar repetidamente el mismo producto
-    y sus cuatro contextos públicos.
-    """
-    clave = str(product_id)
-
-    with _lock_productos:
-        futuro = _cache_productos.get(clave)
-        propietario = futuro is None
-
-        if propietario:
-            futuro = Future()
-            _cache_productos[clave] = futuro
-
-    if propietario:
-        try:
-            futuro.set_result(
-                cargar_producto(clave)
-            )
-
-        except Exception as exc:
-            futuro.set_exception(exc)
-
-    return futuro.result()
-
-
-# ============================================================
-# INVENTARIO POR BODEGA
-# ============================================================
-
-def obtener_inventario(sku_id):
-    inventario = api(
-        f"/api/logistics/pvt/inventory/skus/{sku_id}"
+def cargar_inventario(sku_id):
+    inventario = objeto(
+        api(f"/api/logistics/pvt/inventory/skus/{sku_id}"),
+        f"inventario {sku_id}",
     )
 
-    if (
-        not isinstance(inventario, dict)
-        or not isinstance(
-            inventario.get("balance"),
-            list,
-        )
-    ):
-        raise ErrorConsulta(
-            f"Inventario inesperado para SKU {sku_id}"
+    balances = inventario.get("balance")
+
+    if not isinstance(balances, list):
+        raise ErrorAPI(
+            f"Inventario sin balance válido: SKU {sku_id}."
         )
 
     detalle = []
 
-    for balance in inventario["balance"]:
+    for balance in balances:
         if not isinstance(balance, dict):
-            raise ErrorConsulta(
-                f"Balance inválido para SKU {sku_id}"
+            raise ErrorAPI(
+                f"Balance inválido: SKU {sku_id}."
             )
 
-        total = numero(
-            balance.get("totalQuantity")
-        )
-
-        reservado = numero(
-            balance.get("reservedQuantity")
-        )
-
-        ilimitado = balance.get(
-            "hasUnlimitedQuantity"
-        )
+        total = numero(balance.get("totalQuantity"))
+        reservado = numero(balance.get("reservedQuantity"))
+        ilimitado = balance.get("hasUnlimitedQuantity")
 
         disponible = None
 
-        # Si es ilimitado, no se representa mediante
-        # una cantidad finita disponible.
         if (
             ilimitado is False
             and total is not None
@@ -621,331 +614,291 @@ def obtener_inventario(sku_id):
 
 
 # ============================================================
-# DIAGNÓSTICO
+# CONSULTA PÚBLICA POR PRODUCTO Y PAÍS
 # ============================================================
 
-def diagnosticar(
-    sku,
-    producto,
-    contexto,
-    tiene_politica,
-    politica_activa,
-    item,
-    seller,
-    offer,
-):
-    hallazgos = []
+@lru_cache(maxsize=4096)
+def buscar_producto(pais, product_id):
+    config = PAISES[pais]
 
-    if sku.get("IsActive") is False:
-        hallazgos.append(
-            "SKU_INACTIVO"
-        )
+    with LOCK_PAIS:
+        circuito = CIRCUITOS[pais]
 
-    if producto.get("IsActive") is False:
-        hallazgos.append(
-            "PRODUCTO_INACTIVO"
-        )
+        if circuito["abierto"]:
+            return {
+                "ok": False,
+                "items": {},
+                "fuente": "",
+                "error": (
+                    f"Consultas de {pais} pausadas por errores repetidos."
+                ),
+            }
 
-    if producto.get("IsVisible") is False:
-        hallazgos.append(
-            "PRODUCTO_NO_VISIBLE_CONFIG"
-        )
+        preferida = circuito["ruta"]
 
-    if contexto.get("IsBrandActive") is False:
-        hallazgos.append(
-            "MARCA_INACTIVA"
-        )
+    # Mantiene siempre la misma política comercial.
+    # Si el dominio público rechaza la ruta con 400/404,
+    # prueba la API de la cuenta compartida con el mismo sc.
+    rutas = list(dict.fromkeys([
+        preferida,
+        config["url"],
+        BASE,
+    ]))
 
-    if contexto.get("IsDirectCategoryActive") is False:
-        hallazgos.append(
-            "CATEGORIA_INACTIVA"
-        )
+    errores = []
+    fuente = ""
 
-    if not tiene_politica:
-        hallazgos.append(
-            "SIN_POLITICA_DEL_PAIS"
-        )
+    for ruta in rutas:
+        fuente = ruta + "/api/catalog_system/pub/products/search"
 
-    if politica_activa is False:
-        hallazgos.append(
-            "POLITICA_INACTIVA"
-        )
-
-    if item is None:
-        hallazgos.append(
-            "NO_DEVUELTO_POR_BUSQUEDA"
-        )
-
-    elif seller is None:
-        hallazgos.append(
-            "SIN_OFERTA_SIMAN_EN_RESPUESTA"
-        )
-
-    else:
-        cantidad = numero(
-            offer.get("AvailableQuantity")
-        )
-
-        precio = numero(
-            offer.get("Price")
-        )
-
-        if offer.get("IsAvailable") is False:
-            hallazgos.append(
-                "OFERTA_NO_DISPONIBLE"
+        try:
+            productos = obtener_json(
+                fuente,
+                params={
+                    "fq": f"productId:{product_id}",
+                    "sc": config["sc"],
+                    "_from": 0,
+                    "_to": 0,
+                },
             )
 
-        if (
-            cantidad is not None
-            and cantidad <= 0
-        ):
-            hallazgos.append(
-                "SIN_STOCK_EN_OFERTA"
-            )
+            if not isinstance(productos, list):
+                raise ErrorAPI(
+                    f"Respuesta pública inválida para {pais}."
+                )
 
-        if (
-            precio is not None
-            and precio <= 0
-        ):
-            hallazgos.append(
-                "PRECIO_CERO_EN_OFERTA"
-            )
+            items = {}
 
-        if (
-            offer.get("IsAvailable") is True
-            and cantidad is not None
-            and cantidad > 0
-        ):
-            hallazgos.append(
-                "OFERTA_DISPONIBLE_EN_CONTEXTO_CONSULTADO"
-            )
+            for producto in productos:
+                if not isinstance(producto, dict):
+                    raise ErrorAPI(
+                        f"Producto público inválido para {pais}."
+                    )
 
-    return (
-        " | ".join(hallazgos)
-        or "REVISAR"
+                if str(producto.get("productId")) != str(product_id):
+                    raise ErrorAPI(
+                        "La búsqueda devolvió un producto "
+                        "distinto al solicitado."
+                    )
+
+                for item in producto.get("items") or []:
+                    item_id = item.get("itemId")
+
+                    if item_id is not None:
+                        items[str(item_id)] = item
+
+            with LOCK_PAIS:
+                CIRCUITOS[pais]["errores"] = 0
+                CIRCUITOS[pais]["ruta"] = ruta
+
+            if errores:
+                print(
+                    f"{pais}: se utilizó {ruta} con "
+                    f"sc={config['sc']}. "
+                    "El dominio anterior rechazó la consulta.",
+                    flush=True,
+                )
+
+            return {
+                "ok": True,
+                "items": items,
+                "fuente": fuente,
+                "error": "",
+            }
+
+        except ErrorAPI as exc:
+            errores.append(texto_seguro(exc))
+
+            # Solo cambia de ruta ante rechazo de solicitud/ruta.
+            if exc.status not in (400, 404):
+                break
+
+    detalle = " | ".join(errores)
+
+    with LOCK_PAIS:
+        CIRCUITOS[pais]["errores"] += 1
+
+        if CIRCUITOS[pais]["errores"] >= MAX_ERRORES_PAIS:
+            CIRCUITOS[pais]["abierto"] = True
+
+    print(
+        f"ERROR PUBLICO {pais}, producto {product_id}: {detalle}",
+        flush=True,
     )
+
+    return {
+        "ok": False,
+        "items": {},
+        "fuente": fuente,
+        "error": detalle,
+    }
 
 
 # ============================================================
 # PROCESAMIENTO DE SKU
 # ============================================================
 
-def procesar_sku(sku_id, politicas_catalogo):
-    sku = validar_objeto(
-        api(
-            f"/api/catalog/pvt/stockkeepingunit/{sku_id}"
-        ),
-        f"SKU administrativo {sku_id}",
+def procesar_sku(sku_id, binding, politicas_catalogo):
+    sku = objeto(
+        api(f"/api/catalog/pvt/stockkeepingunit/{sku_id}"),
+        f"SKU {sku_id}",
     )
-
-    contexto = validar_objeto(
-        api(
-            "/api/catalog_system/pvt/sku/"
-            f"stockkeepingunitbyid/{sku_id}"
-        ),
-        f"contexto del SKU {sku_id}",
-    )
-
-    sellers = contexto.get("SkuSellers") or []
-
-    propios = [
-        seller
-        for seller in sellers
-        if str(seller.get("SellerId")) == SELLER_ID
-    ]
-
-    identidad = {
-        "sku_id": sku_id,
-        "ref_sku": sku.get("RefId"),
-        "productId": sku.get("ProductId"),
-    }
-
-    # Conserva también los vínculos propios inactivos.
-    if not propios:
-        if sellers:
-            return {
-                "tipo": "excluido",
-                "registro": {
-                    **identidad,
-                    "motivo": (
-                        "SOLO_SELLERS_DISTINTOS_DE_SIMAN"
-                    ),
-                    "sellers_ids": "|".join(
-                        str(seller.get("SellerId"))
-                        for seller in sellers
-                    ),
-                },
-            }
-
-        # Sin seller no se puede confirmar que sea propio.
-        # Se registra como pendiente, no como Marketplace.
-        return {
-            "tipo": "pendiente",
-            "registro": {
-                **identidad,
-                "motivo": (
-                    "SIN_SELLERS_PARA_CONFIRMAR_ORIGEN"
-                ),
-            },
-        }
 
     product_id = sku.get("ProductId")
 
     if product_id is None:
-        raise ErrorConsulta(
-            f"SKU {sku_id} sin ProductId"
-        )
+        raise ErrorAPI(f"SKU {sku_id} sin ProductId.")
 
-    datos_producto = obtener_producto(
-        product_id
+    producto, politicas = cargar_producto(str(product_id))
+    contexto, error_contexto = cargar_contexto(sku_id)
+
+    error_inventario = ""
+
+    try:
+        bodegas = cargar_inventario(sku_id)
+
+    except ErrorAPI as exc:
+        bodegas = None
+        error_inventario = texto_seguro(exc)
+
+    ids_politicas = sorted(
+        politicas,
+        key=lambda valor: (
+            0, int(valor)
+        ) if valor.isdigit() else (
+            1, valor
+        ),
     )
 
-    producto = datos_producto["producto"]
-    ids_politicas = datos_producto["politicas"]
-
-    detalle_bodegas = obtener_inventario(
-        sku_id
-    )
-
-    inventario_json = json.dumps(
-        detalle_bodegas,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    politicas_ordenadas = ordenar_ids(
-        ids_politicas
-    )
-
-    nombres_politicas = [
+    nombres = [
         politicas_catalogo.get(
-            politica_id,
-            {},
-        ).get(
-            "Name",
-            f"ID {politica_id}",
-        )
-        for politica_id in politicas_ordenadas
+            politica_id, {}
+        ).get("Name", f"ID {politica_id}")
+        for politica_id in ids_politicas
     ]
 
-    politica_columnas = {
-        f"politica_{pais.lower()}": (
-            "Y"
-            if config["sc"] in ids_politicas
-            else "N"
-        )
-        for pais, config in PAISES.items()
-    }
-
-    categorias = (
-        contexto.get("ProductCategories")
-        or {}
-    )
-
+    imagen = contexto.get("ImageUrl")
     imagenes = contexto.get("Images") or []
-    imagen_url = contexto.get("ImageUrl")
 
-    if not imagen_url and imagenes:
-        imagen_url = imagenes[0].get("ImageUrl")
+    if not imagen and imagenes:
+        imagen = imagenes[0].get("ImageUrl")
 
+    fecha = ahora()
     filas = []
+    errores = []
+
+    if error_inventario:
+        errores.append(error_inventario)
 
     for pais, config in PAISES.items():
-        sc = config["sc"]
-
-        item = datos_producto["publico"][pais].get(
-            sku_id
+        resultado = buscar_producto(
+            pais,
+            str(product_id),
         )
 
+        item = resultado["items"].get(sku_id)
         seller = None
+        oferta = {}
 
         if item is not None:
             seller = next(
                 (
                     vendedor
-                    for vendedor in (
-                        item.get("sellers") or []
-                    )
-                    if str(
-                        vendedor.get("sellerId")
-                    ) == SELLER_ID
+                    for vendedor in item.get("sellers") or []
+                    if str(vendedor.get("sellerId")) == SELLER_ID
                 ),
                 None,
             )
 
-        offer = (
-            seller.get("commertialOffer") or {}
-            if seller is not None
-            else {}
-        )
+            if seller is not None:
+                oferta = seller.get("commertialOffer") or {}
 
-        stock_oferta = numero(
-            offer.get("AvailableQuantity")
-        )
+        cantidad = numero(oferta.get("AvailableQuantity"))
+        disponible = oferta.get("IsAvailable")
 
-        # Compatibilidad con la columna visible original.
-        # Representa disponibilidad de oferta, no IsVisible.
-        if item is None or seller is None:
-            disponible_compra = "N"
+        if not resultado["ok"]:
+            aparece = "ERROR_CONSULTA"
+            compra = "ERROR_CONSULTA"
+            estado = "ERROR_CONSULTA"
+            errores.append(f"{pais}: {resultado['error']}")
 
-        elif (
-            offer.get("IsAvailable") is None
-            or stock_oferta is None
-        ):
-            disponible_compra = "DESCONOCIDO"
-
-        else:
-            disponible_compra = (
-                "Y"
-                if (
-                    offer.get("IsAvailable") is True
-                    and stock_oferta > 0
-                )
-                else "N"
-            )
-
-        if item is None:
+        elif item is None:
+            aparece = "N"
+            compra = "N"
             estado = "NO_DEVUELTO_POR_BUSQUEDA"
 
         elif seller is None:
+            aparece = "Y"
+            compra = "N"
             estado = "SIN_OFERTA_SIMAN"
 
-        elif disponible_compra == "Y":
-            estado = "DISPONIBLE"
-
-        elif disponible_compra == "DESCONOCIDO":
+        elif disponible is None or cantidad is None:
+            aparece = "Y"
+            compra = "DESCONOCIDO"
             estado = "DISPONIBILIDAD_DESCONOCIDA"
 
         else:
-            estado = "OFERTA_NO_DISPONIBLE"
+            aparece = "Y"
+            compra = (
+                "Y"
+                if disponible is True and cantidad > 0
+                else "N"
+            )
 
-        politica = politicas_catalogo.get(
-            sc,
-            {},
-        )
+            estado = (
+                "DISPONIBLE"
+                if compra == "Y"
+                else "OFERTA_NO_DISPONIBLE"
+            )
 
-        tiene_politica = sc in ids_politicas
+        sc = config["sc"]
+        politica = politicas_catalogo[sc]
 
-        ruta = (
-            contexto.get("DetailUrl")
-            or producto.get("LinkId")
-            or ""
-        )
+        hallazgos = []
 
-        if ruta.startswith("http"):
-            link = ruta
+        if sku.get("IsActive") is False:
+            hallazgos.append("SKU_INACTIVO")
 
-        elif ruta:
-            if not ruta.startswith("/"):
-                ruta = "/" + ruta + "/p"
+        if producto.get("IsActive") is False:
+            hallazgos.append("PRODUCTO_INACTIVO")
 
-            link = config["url"] + ruta
+        if producto.get("IsVisible") is False:
+            hallazgos.append("PRODUCTO_NO_VISIBLE_CONFIG")
 
-        else:
-            link = None
+        if sc not in politicas:
+            hallazgos.append("SIN_POLITICA_DEL_PAIS")
+
+        if politica.get("IsActive") is False:
+            hallazgos.append("POLITICA_INACTIVA")
+
+        if error_inventario:
+            hallazgos.append("ERROR_CONSULTA_INVENTARIO")
+
+        hallazgos.append(estado)
+
+        if cantidad is not None and cantidad <= 0:
+            hallazgos.append("SIN_STOCK_EN_OFERTA")
+
+        precio = numero(oferta.get("Price"))
+
+        if precio is not None and precio <= 0:
+            hallazgos.append("PRECIO_CERO_EN_OFERTA")
+
+        ruta = contexto.get("DetailUrl")
+
+        if not ruta and producto.get("LinkId"):
+            ruta = "/" + producto["LinkId"].strip("/") + "/p"
+
+        link = None
+
+        if ruta:
+            link = (
+                ruta
+                if ruta.startswith("http")
+                else config["url"] + "/" + ruta.lstrip("/")
+            )
 
         filas.append({
-            # Columnas originales
             "pais": pais,
             "productReference": producto.get("RefId"),
             "productId": product_id,
@@ -953,11 +906,14 @@ def procesar_sku(sku_id, politicas_catalogo):
             "ref_sku": sku.get("RefId"),
             "sku_id": sku_id,
             "variante": sku.get("Name"),
-            "visible": disponible_compra,
+
+            # Conserva la interpretación histórica:
+            # disponible en la oferta del país.
+            "visible": compra,
             "estado": estado,
-            "stock_sku": stock_oferta,
-            "precio_regular": offer.get("ListPrice"),
-            "precio_actual": offer.get("Price"),
+            "stock_sku": cantidad,
+            "precio_regular": oferta.get("ListPrice"),
+            "precio_actual": oferta.get("Price"),
             "es_propio": "Siman",
             "seller": (
                 seller.get("sellerName")
@@ -966,17 +922,14 @@ def procesar_sku(sku_id, politicas_catalogo):
             ),
             "brand": contexto.get("BrandName"),
             "link": link,
-            "imagen_url": imagen_url,
+            "imagen_url": imagen,
 
-            # Estado administrativo
             "cuenta": ACCOUNT,
             "seller_id": SELLER_ID,
             "seller_vinculo_activo": bandera(
-                propios[0].get("IsActive")
+                binding.get("IsActive")
             ),
-            "sku_activo": bandera(
-                sku.get("IsActive")
-            ),
+            "sku_activo": bandera(sku.get("IsActive")),
             "producto_activo": bandera(
                 producto.get("IsActive")
             ),
@@ -986,71 +939,116 @@ def procesar_sku(sku_id, politicas_catalogo):
             "mostrar_sin_stock": bandera(
                 producto.get("ShowWithoutStock")
             ),
-            "marca_activa": bandera(
-                contexto.get("IsBrandActive")
-            ),
-            "categoria_activa": bandera(
-                contexto.get("IsDirectCategoryActive")
-            ),
-
-            # Categorías
             "categoria_id": producto.get("CategoryId"),
             "categorias": json.dumps(
-                categorias,
+                contexto.get("ProductCategories") or {},
                 ensure_ascii=False,
-                separators=(",", ":"),
             ),
             "rutas_categorias": "|".join(
                 contexto.get("CategoriesFullPath") or []
             ),
+            "aparece_busqueda": aparece,
+            "disponible_compra": compra,
 
-            # Consulta pública
-            "aparece_busqueda": (
-                "Y" if item is not None else "N"
-            ),
-            "disponible_compra": disponible_compra,
-
-            # Políticas comerciales
             "politica_consultada_id": sc,
-            "politica_consultada_nombre": politica.get(
-                "Name"
-            ),
+            "politica_consultada_nombre": politica.get("Name"),
             "politica_consultada_activa": bandera(
                 politica.get("IsActive")
             ),
             "asociado_politica_pais": (
-                "Y" if tiene_politica else "N"
+                "Y" if sc in politicas else "N"
             ),
-            "politicas_ids": "|".join(
-                politicas_ordenadas
-            ),
-            "politicas_nombres": "|".join(
-                nombres_politicas
-            ),
-            **politica_columnas,
+            "politicas_ids": "|".join(ids_politicas),
+            "politicas_nombres": "|".join(nombres),
 
-            # Inventario de la cuenta compartida
-            "cantidad_bodegas": len(detalle_bodegas),
-            "inventario_bodegas_json": inventario_json,
+            **{
+                f"politica_{codigo.lower()}": (
+                    "Y"
+                    if datos["sc"] in politicas
+                    else "N"
+                )
+                for codigo, datos in PAISES.items()
+            },
 
-            # Diagnóstico y control
-            "diagnostico": diagnosticar(
-                sku,
-                producto,
-                contexto,
-                tiene_politica,
-                politica.get("IsActive"),
-                item,
-                seller,
-                offer,
+            "cantidad_bodegas": (
+                len(bodegas)
+                if bodegas is not None
+                else None
             ),
-            "fecha_extraccion_utc": FECHA_INICIO,
+            "inventario_bodegas_json": (
+                json.dumps(
+                    bodegas,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                if bodegas is not None
+                else None
+            ),
+            "fuente_busqueda": resultado["fuente"],
+            "error_busqueda": resultado["error"],
+            "error_inventario": error_inventario,
+            "error_contexto": error_contexto,
+            "diagnostico": " | ".join(hallazgos),
+            "fecha_extraccion_utc": fecha,
         })
 
     return {
-        "tipo": "siman",
-        "catalogo": filas,
+        "ok": not errores,
+        "filas": filas,
+        "error": texto_seguro(" | ".join(errores)),
     }
+
+
+# ============================================================
+# EXPORTACIÓN: UN SOLO CSV
+# ============================================================
+
+def exportar(db, completo):
+    temporal = ARCHIVO + ".tmp"
+    cantidad = 0
+    inicio = leer_meta(db, "inicio", "")
+    fin = ahora()
+
+    with open(
+        temporal,
+        "w",
+        encoding="utf-8-sig",
+        newline="",
+    ) as archivo:
+        escritor = csv.DictWriter(
+            archivo,
+            fieldnames=COLUMNAS,
+            delimiter=";",
+            extrasaction="ignore",
+        )
+
+        escritor.writeheader()
+
+        cursor = db.execute(
+            "SELECT filas FROM sku WHERE filas IS NOT NULL"
+        )
+
+        for (datos,) in cursor:
+            for fila in json.loads(datos):
+                fila["fecha_inicio_ciclo_utc"] = inicio
+                fila["fecha_fin_exportacion_utc"] = fin
+                fila["extraccion_completa"] = (
+                    "Y" if completo else "N"
+                )
+
+                escritor.writerow(fila)
+                cantidad += 1
+
+    os.replace(temporal, ARCHIVO)
+    return cantidad
+
+
+def salida_github(nombre, valor):
+    ruta = os.getenv("GITHUB_OUTPUT")
+
+    if ruta:
+        with open(ruta, "a", encoding="utf-8") as archivo:
+            archivo.write(f"{nombre}={valor}\n")
 
 
 # ============================================================
@@ -1058,54 +1056,42 @@ def procesar_sku(sku_id, politicas_catalogo):
 # ============================================================
 
 def main():
-    catalogo = []
-    excluidos = []
-    pendientes = []
-    errores = []
+    salida_github("publicar", "false")
 
-    ids = []
-    procesados = 0
-    propios = 0
+    db = abrir_estado()
+    fallo = False
+    pausa = False
+    intentados = 0
+    errores_seguidos = 0
     completo = False
 
     try:
         if not APP_KEY or not APP_TOKEN:
             raise RuntimeError(
-                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN "
-                "en las variables de entorno."
+                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN."
             )
 
-        print(
-            f"Iniciando cuenta {ACCOUNT}; "
-            f"seller propio {SELLER_ID}",
-            flush=True,
-        )
+        preparar_ciclo(db)
 
-        politicas_filas = api(
+        politicas = api(
             "/api/catalog_system/pvt/saleschannel/list"
         )
 
-        if not isinstance(politicas_filas, list):
-            raise ErrorConsulta(
-                "Listado de políticas inesperado"
-            )
+        if not isinstance(politicas, list):
+            raise ErrorAPI("Listado de políticas inválido.")
 
         politicas_catalogo = {
-            str(politica["Id"]): politica
-            for politica in politicas_filas
-            if (
-                isinstance(politica, dict)
-                and "Id" in politica
-            )
+            str(p["Id"]): p
+            for p in politicas
+            if isinstance(p, dict) and p.get("Id") is not None
         }
 
         for pais, config in PAISES.items():
             sc = config["sc"]
 
             if sc not in politicas_catalogo:
-                raise ErrorConsulta(
-                    f"No existe la política {sc} "
-                    f"configurada para {pais}"
+                raise ErrorAPI(
+                    f"No existe la política {sc} para {pais}."
                 )
 
             print(
@@ -1114,34 +1100,50 @@ def main():
                 flush=True,
             )
 
-        ids = obtener_todos_los_sku()
+        cargar_sku_siman(db)
 
         print(
-            f"\nSKU registrados: {len(ids)}\n",
+            f"Modo={'PRUEBA' if SOLO_PRUEBA else 'EXTRACCION'}; "
+            f"hilos={WORKERS}; máximo={RPS} solicitudes/s.",
             flush=True,
         )
 
-        with ThreadPoolExecutor(
-            max_workers=MAX_WORKERS
-        ) as executor:
-            tamano_lote = MAX_WORKERS * 20
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            while True:
+                revisar_tiempo()
 
-            for inicio in range(
-                0,
-                len(ids),
-                tamano_lote,
-            ):
-                lote = ids[
-                    inicio:inicio + tamano_lote
-                ]
+                limite = (
+                    min(WORKERS, 3 - intentados)
+                    if SOLO_PRUEBA
+                    else WORKERS
+                )
+
+                if limite <= 0:
+                    break
+
+                lote = db.execute(
+                    """
+                    SELECT id, binding
+                    FROM sku
+                    WHERE estado != 1
+                      AND COALESCE(ultima_ejecucion, '') != ?
+                    ORDER BY estado DESC, id
+                    LIMIT ?
+                    """,
+                    (RUN_ID, limite),
+                ).fetchall()
+
+                if not lote:
+                    break
 
                 futuros = {
                     executor.submit(
                         procesar_sku,
                         sku_id,
+                        json.loads(binding),
                         politicas_catalogo,
                     ): sku_id
-                    for sku_id in lote
+                    for sku_id, binding in lote
                 }
 
                 for futuro in as_completed(futuros):
@@ -1149,167 +1151,199 @@ def main():
 
                     try:
                         resultado = futuro.result()
-                        tipo = resultado["tipo"]
+                        correcto = resultado["ok"]
 
-                        if tipo == "siman":
-                            propios += 1
-
-                            catalogo.extend(
-                                resultado["catalogo"]
+                        with db:
+                            db.execute(
+                                """
+                                UPDATE sku
+                                SET estado = ?,
+                                    filas = ?,
+                                    error = ?,
+                                    ultima_ejecucion = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    1 if correcto else 2,
+                                    json.dumps(
+                                        resultado["filas"],
+                                        ensure_ascii=False,
+                                    ),
+                                    resultado["error"],
+                                    RUN_ID,
+                                    sku_id,
+                                ),
                             )
 
-                        elif tipo == "excluido":
-                            excluidos.append(
-                                resultado["registro"]
-                            )
-
+                        if correcto:
+                            errores_seguidos = 0
                         else:
-                            pendientes.append(
-                                resultado["registro"]
+                            errores_seguidos += 1
+                            print(
+                                f"SKU {sku_id}: "
+                                f"{resultado['error']}",
+                                flush=True,
                             )
+
+                        if SOLO_PRUEBA:
+                            for fila in resultado["filas"]:
+                                print(
+                                    f"PRUEBA SKU={sku_id}; "
+                                    f"pais={fila['pais']}; "
+                                    f"estado={fila['estado']}; "
+                                    f"fuente={fila['fuente_busqueda']}",
+                                    flush=True,
+                                )
+
+                    except PausaExtraccion:
+                        pausa = True
 
                     except Exception as exc:
-                        errores.append({
-                            "sku_id": sku_id,
-                            "error": str(exc),
-                        })
+                        errores_seguidos += 1
+
+                        detalle = texto_seguro(exc)
+
+                        with db:
+                            db.execute(
+                                """
+                                UPDATE sku
+                                SET estado = 2,
+                                    error = ?,
+                                    ultima_ejecucion = ?
+                                WHERE id = ?
+                                """,
+                                (detalle, RUN_ID, sku_id),
+                            )
 
                         print(
-                            f"Error SKU {sku_id}: {exc}",
+                            f"ERROR SKU {sku_id}: {detalle}",
                             flush=True,
                         )
 
-                    procesados += 1
+                    intentados += 1
 
-                    if (
-                        procesados % 100 == 0
-                        or procesados == len(ids)
-                    ):
-                        print(
-                            f"Procesados {procesados}/"
-                            f"{len(ids)}; "
-                            f"Siman {propios}; "
-                            f"excluidos {len(excluidos)}; "
-                            f"pendientes {len(pendientes)}; "
-                            f"errores {len(errores)}",
-                            flush=True,
-                        )
+                total, listos = db.execute(
+                    """
+                    SELECT COUNT(*),
+                           COALESCE(SUM(estado = 1), 0)
+                    FROM sku
+                    """
+                ).fetchone()
 
-        if propios == 0:
-            errores.append({
-                "sku_id": "",
-                "error": (
-                    "No se confirmó ningún SKU de Siman"
-                ),
-            })
+                print(
+                    f"Avance: {listos}/{total} SKU completos; "
+                    f"intentados en esta ejecución: {intentados}",
+                    flush=True,
+                )
+
+                with LOCK_PAIS:
+                    abierto = any(
+                        circuito["abierto"]
+                        for circuito in CIRCUITOS.values()
+                    )
+
+                if abierto or errores_seguidos >= 3:
+                    fallo = True
+                    print(
+                        "Se detiene el lote por errores repetidos. "
+                        "El avance queda guardado.",
+                        flush=True,
+                    )
+                    break
+
+                if pausa:
+                    break
+
+        total, listos = db.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(estado = 1), 0)
+            FROM sku
+            """
+        ).fetchone()
 
         completo = (
-            procesados == len(ids)
-            and propios > 0
-            and not errores
-            and not pendientes
+            total > 0
+            and total == listos
+            and not SOLO_PRUEBA
+            and not fallo
+            and not pausa
+        )
+
+    except PausaExtraccion:
+        pausa = True
+        print(
+            "Tiempo de trabajo alcanzado. "
+            "Se continuará desde el avance guardado.",
+            flush=True,
         )
 
     except Exception as exc:
-        errores.append({
-            "sku_id": "",
-            "error": str(exc),
-        })
-
+        fallo = True
         print(
-            f"Error general: {exc}",
+            f"ERROR GENERAL: {texto_seguro(exc)}",
             flush=True,
         )
 
     finally:
-        fecha_fin = datetime.now(
-            timezone.utc
-        ).isoformat()
+        try:
+            filas = exportar(db, completo)
 
-        for fila in catalogo:
-            fila["fecha_fin_extraccion_utc"] = fecha_fin
+            total, listos = db.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(estado = 1), 0)
+                FROM sku
+                """
+            ).fetchone()
 
-            fila["extraccion_completa"] = (
-                "Y" if completo else "N"
+            print(
+                "\nRESUMEN\n"
+                + json.dumps(
+                    {
+                        "archivo": ARCHIVO,
+                        "sku_del_ciclo": total,
+                        "sku_completos": listos,
+                        "sku_por_completar": total - listos,
+                        "filas_csv": filas,
+                        "solo_prueba": SOLO_PRUEBA,
+                        "extraccion_completa": completo,
+                        "pausado": pausa,
+                        "errores_repetidos": fallo,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                flush=True,
             )
 
-        # Único archivo generado.
-        filas_finales = guardar_catalogo(
-            catalogo
+            if completo:
+                with db:
+                    escribir_meta(db, "completo", "1")
+
+                salida_github("publicar", "true")
+
+        finally:
+            db.close()
+
+    if fallo:
+        raise SystemExit(
+            "Revisa los errores. No se reemplazará el CSV publicado."
         )
 
-        resumen = {
-            "cuenta": ACCOUNT,
-            "seller_propio": SELLER_ID,
-            "inicio_utc": FECHA_INICIO,
-            "fin_utc": fecha_fin,
-            "completo": completo,
-            "sku_enumerados": len(ids),
-            "sku_procesados": procesados,
-            "sku_siman": propios,
-            "sku_excluidos_otros_sellers": len(excluidos),
-            "sku_pendientes_clasificacion": len(pendientes),
-            "consultas_con_error": len(errores),
-            "filas_catalogo": filas_finales,
-            "archivo": ARCHIVO_SALIDA,
-        }
-
+    if SOLO_PRUEBA:
         print(
-            "\nRESUMEN\n"
-            + json.dumps(
-                resumen,
-                ensure_ascii=False,
-                indent=2,
-            ),
+            "Prueba terminada. Revisa los resultados antes "
+            "de ejecutar la extracción completa.",
             flush=True,
         )
 
-        # Los registros de revisión quedan en GitHub Actions,
-        # sin crear archivos adicionales.
-        for registro in pendientes:
-            print(
-                "SKU PENDIENTE: "
-                + json.dumps(
-                    registro,
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-
-        for registro in errores:
-            print(
-                "ERROR EXTRACCION: "
-                + json.dumps(
-                    registro,
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-
-        for pais in PAISES:
-            total = sum(
-                1
-                for fila in catalogo
-                if fila["pais"] == pais
-            )
-
-            print(
-                f"{pais}: {total} filas",
-                flush=True,
-            )
-
-    if not completo:
-        raise SystemExit(
-            "Extracción incompleta. Revisa el registro "
-            "de GitHub Actions. No se actualizará "
-            "el release latest."
+    elif not completo:
+        print(
+            "Recorrido pendiente. No se reemplaza latest. "
+            "La próxima ejecución retomará el avance.",
+            flush=True,
         )
-
-    print(
-        f"\nExtracción completa. "
-        f"{ARCHIVO_SALIDA} listo para publicar.",
-        flush=True,
-    )
 
 
 if __name__ == "__main__":
