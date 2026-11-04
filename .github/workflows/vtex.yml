@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    # 11:00 UTC = 5:00 a. m. de El Salvador
+    # 5:00 a. m. de El Salvador = 11:00 UTC
     - cron: "0 11 * * *"
 
 permissions:
@@ -31,61 +31,36 @@ jobs:
       - name: Instalar dependencias
         run: python -m pip install requests pandas
 
-      - name: Ejecutar extracción
+      - name: Ejecutar catalogo
         env:
           PYTHONUNBUFFERED: "1"
           VTEX_ACCOUNT: siman
           VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
           VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
-
-          # Seller propio de Siman
           VTEX_SELLER_ID: "1"
-
-          # Concurrencia moderada para las APIs
           MAX_WORKERS: "6"
-
-          # IDs según la captura de políticas comerciales
           SC_SV: "1"
           SC_CR: "2"
           SC_NI: "3"
           SC_GT: "4"
-
         run: python main.py
 
-      # También conserva los resultados parciales si falla Python.
-      - name: Guardar archivos de revisión
-        if: always()
+      - name: Ver tamaño CSV
+        run: ls -lh catalogo_CAM.csv
+
+      - name: Guardar CSV
         uses: actions/upload-artifact@v4
         with:
-          name: catalogo_CAM_${{ github.run_id }}
-          path: |
-            catalogo_CAM.csv
-            inventario_bodegas.csv
-            sku_politicas.csv
-            politicas_comerciales.csv
-            sku_excluidos.csv
-            sku_pendientes.csv
-            errores_extraccion.csv
-            resumen_extraccion.json
-          if-no-files-found: warn
-          retention-days: 14
+          name: catalogo_CAM
+          path: catalogo_CAM.csv
+          if-no-files-found: error
 
-      # Solo se ejecuta cuando la extracción termina correctamente.
-      - name: Actualizar Release
+      - name: Crear Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: VTEX Catalogo
+          files: catalogo_CAM.csv
           overwrite_files: true
           fail_on_unmatched_files: true
-          files: |
-            catalogo_CAM.csv
-            inventario_bodegas.csv
-            sku_politicas.csv
-            politicas_comerciales.csv
-            sku_excluidos.csv
-            sku_pendientes.csv
-            errores_extraccion.csv
-            resumen_extraccion.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
