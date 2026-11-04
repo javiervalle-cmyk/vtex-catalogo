@@ -38,30 +38,85 @@ BASE_PRIVADA = (
     f"https://{ACCOUNT}.vtexcommercestable.com.br"
 )
 
-# IDs tomados de tu captura.
-# Son configurables desde el workflow.
+# Políticas comerciales según tu captura.
 PAISES = {
     "SV": {
         "url": "https://sv.siman.com",
-        "sc": os.getenv("SC_SV", "1"),
+        "sc": os.getenv("SC_SV", "1").strip(),
     },
     "GT": {
         "url": "https://gt.siman.com",
-        "sc": os.getenv("SC_GT", "4"),
+        "sc": os.getenv("SC_GT", "4").strip(),
     },
     "NI": {
         "url": "https://ni.siman.com",
-        "sc": os.getenv("SC_NI", "3"),
+        "sc": os.getenv("SC_NI", "3").strip(),
     },
     "CR": {
         "url": "https://cr.siman.com",
-        "sc": os.getenv("SC_CR", "2"),
+        "sc": os.getenv("SC_CR", "2").strip(),
     },
 }
 
-FECHA = datetime.now(timezone.utc).isoformat()
+FECHA_INICIO = datetime.now(timezone.utc).isoformat()
+
+ARCHIVO_SALIDA = "catalogo_CAM.csv"
+
+# Las columnas originales se mantienen al inicio.
+COLUMNAS = [
+    "pais",
+    "productReference",
+    "productId",
+    "productName",
+    "ref_sku",
+    "sku_id",
+    "variante",
+    "visible",
+    "estado",
+    "stock_sku",
+    "precio_regular",
+    "precio_actual",
+    "es_propio",
+    "seller",
+    "brand",
+    "link",
+    "imagen_url",
+
+    # Nuevas columnas
+    "cuenta",
+    "seller_id",
+    "seller_vinculo_activo",
+    "sku_activo",
+    "producto_activo",
+    "producto_visible_config",
+    "mostrar_sin_stock",
+    "marca_activa",
+    "categoria_activa",
+    "categoria_id",
+    "categorias",
+    "rutas_categorias",
+    "aparece_busqueda",
+    "disponible_compra",
+    "politica_consultada_id",
+    "politica_consultada_nombre",
+    "politica_consultada_activa",
+    "asociado_politica_pais",
+    "politicas_ids",
+    "politicas_nombres",
+    "politica_sv",
+    "politica_gt",
+    "politica_ni",
+    "politica_cr",
+    "cantidad_bodegas",
+    "inventario_bodegas_json",
+    "diagnostico",
+    "fecha_extraccion_utc",
+    "fecha_fin_extraccion_utc",
+    "extraccion_completa",
+]
 
 _local = threading.local()
+
 _cache_productos = {}
 _lock_productos = threading.Lock()
 
@@ -75,16 +130,19 @@ class ErrorConsulta(RuntimeError):
 
 
 def bandera(valor):
-    """No convierte un valor desconocido en N."""
+    """
+    No convierte información desconocida en N.
+    """
     if valor is True:
         return "Y"
+
     if valor is False:
         return "N"
+
     return "DESCONOCIDO"
 
 
 def numero(valor):
-    """Conserva valores desconocidos como None."""
     if valor is None:
         return None
 
@@ -94,28 +152,46 @@ def numero(valor):
         return None
 
 
+def ordenar_ids(valores):
+    return sorted(
+        valores,
+        key=lambda valor: (
+            0,
+            int(valor),
+        ) if str(valor).isdigit() else (
+            1,
+            str(valor),
+        ),
+    )
+
+
 def sesion(privada):
     """
-    Una sesión por hilo y tipo de consulta.
-    Las credenciales nunca se envían a los dominios públicos.
+    Crea una sesión por hilo.
+
+    Las credenciales solo se utilizan en consultas privadas.
     """
     nombre = "privada" if privada else "publica"
 
     if not hasattr(_local, nombre):
-        s = requests.Session()
+        nueva_sesion = requests.Session()
 
-        s.headers.update({
+        nueva_sesion.headers.update({
             "Accept": "application/json",
             "User-Agent": "Siman-Catalogo-Auditoria/1.0",
         })
 
         if privada:
-            s.headers.update({
+            nueva_sesion.headers.update({
                 "X-VTEX-API-AppKey": APP_KEY,
                 "X-VTEX-API-AppToken": APP_TOKEN,
             })
 
-        setattr(_local, nombre, s)
+        setattr(
+            _local,
+            nombre,
+            nueva_sesion,
+        )
 
     return getattr(_local, nombre)
 
@@ -126,24 +202,50 @@ def espera_reintento(respuesta, intento):
 
         if valor:
             try:
-                return max(0, float(valor))
+                return max(
+                    0,
+                    float(valor),
+                )
+
             except ValueError:
                 try:
                     fecha = parsedate_to_datetime(valor)
+
                     return max(
                         0,
                         fecha.timestamp() - time.time(),
                     )
-                except (ValueError, TypeError, OverflowError):
+
+                except (
+                    ValueError,
+                    TypeError,
+                    OverflowError,
+                ):
                     pass
 
-    return min(60, 2 ** (intento + 1)) + random.random()
+    return (
+        min(
+            60,
+            2 ** (intento + 1),
+        )
+        + random.random()
+    )
 
 
-def obtener_json(url, privada=False, params=None):
+def obtener_json(
+    url,
+    privada=False,
+    params=None,
+):
     """
-    Reintenta errores de red, JSON inválido, 408, 429 y 5xx.
-    Los demás errores HTTP se reportan sin reintentos.
+    Reintenta:
+    - Errores de conexión.
+    - Timeout.
+    - JSON inválido.
+    - HTTP 408.
+    - HTTP 429.
+    - HTTP 5xx.
+
     No imprime credenciales ni cuerpos de respuesta.
     """
     for intento in range(MAX_REINTENTOS):
@@ -162,6 +264,7 @@ def obtener_json(url, privada=False, params=None):
             if codigo == 200:
                 try:
                     return respuesta.json()
+
                 except ValueError:
                     causa = "Respuesta JSON inválida"
 
@@ -181,18 +284,23 @@ def obtener_json(url, privada=False, params=None):
                 f"{causa}, agotados los reintentos: {url}"
             )
 
-        espera = espera_reintento(respuesta, intento)
+        espera = espera_reintento(
+            respuesta,
+            intento,
+        )
 
         print(
             f"Reintento {intento + 1}/"
-            f"{MAX_REINTENTOS}: {causa}; "
-            f"espera {espera:.1f}s",
+            f"{MAX_REINTENTOS}: "
+            f"{causa}; espera {espera:.1f}s",
             flush=True,
         )
 
         time.sleep(espera)
 
-    raise ErrorConsulta(f"Consulta sin resultado: {url}")
+    raise ErrorConsulta(
+        f"Consulta sin resultado: {url}"
+    )
 
 
 def api(ruta, params=None):
@@ -204,7 +312,10 @@ def api(ruta, params=None):
 
 
 def validar_objeto(valor, descripcion):
-    if not isinstance(valor, dict) or not valor:
+    if (
+        not isinstance(valor, dict)
+        or not valor
+    ):
         raise ErrorConsulta(
             f"Respuesta inesperada: {descripcion}"
         )
@@ -212,13 +323,34 @@ def validar_objeto(valor, descripcion):
     return valor
 
 
-def guardar_csv(nombre, filas, columnas_minimas):
-    df = pd.DataFrame(filas)
+def guardar_catalogo(filas):
+    """
+    Genera únicamente catalogo_CAM.csv.
+    Mantiene las columnas incluso si no hay filas.
+    """
+    df = pd.DataFrame(
+        filas,
+        columns=COLUMNAS,
+    )
 
-    if df.empty:
-        df = pd.DataFrame(columns=columnas_minimas)
+    if not df.empty:
+        df.drop_duplicates(
+            subset=[
+                "pais",
+                "sku_id",
+            ],
+            inplace=True,
+        )
 
-    temporal = nombre + ".tmp"
+        df.sort_values(
+            by=[
+                "pais",
+                "sku_id",
+            ],
+            inplace=True,
+        )
+
+    temporal = ARCHIVO_SALIDA + ".tmp"
 
     df.to_csv(
         temporal,
@@ -227,7 +359,12 @@ def guardar_csv(nombre, filas, columnas_minimas):
         encoding="utf-8-sig",
     )
 
-    os.replace(temporal, nombre)
+    os.replace(
+        temporal,
+        ARCHIVO_SALIDA,
+    )
+
+    return len(df)
 
 
 # ============================================================
@@ -260,7 +397,13 @@ def obtener_todos_los_sku():
         nuevos = []
 
         for valor in resultado:
-            if isinstance(valor, (dict, list, bool)):
+            if (
+                valor is None
+                or isinstance(
+                    valor,
+                    (dict, list, bool),
+                )
+            ):
                 raise ErrorConsulta(
                     "ID inesperado en el listado de SKU"
                 )
@@ -273,8 +416,8 @@ def obtener_todos_los_sku():
 
         if not nuevos:
             raise ErrorConsulta(
-                "La paginación repitió una página completa; "
-                "se detuvo para evitar un catálogo incompleto"
+                "La paginación repitió una página completa. "
+                "Se detuvo para evitar un catálogo incompleto."
             )
 
         ids.extend(nuevos)
@@ -286,8 +429,8 @@ def obtener_todos_los_sku():
             flush=True,
         )
 
-        # No hay un límite artificial de productos.
-        # Se sigue hasta recibir una página vacía.
+        # Se continúa hasta recibir una página vacía.
+        # No existe un límite artificial de 2,500 productos.
         pagina += 1
 
     if not ids:
@@ -299,7 +442,7 @@ def obtener_todos_los_sku():
 
 
 # ============================================================
-# PRODUCTOS Y CONSULTA PÚBLICA POR PAÍS
+# PRODUCTO, POLÍTICAS Y BÚSQUEDA POR PAÍS
 # ============================================================
 
 def cargar_producto(product_id):
@@ -331,12 +474,12 @@ def cargar_producto(product_id):
                 f"Política sin StoreId para {product_id}"
             )
 
-        ids_politicas.add(str(politica["StoreId"]))
+        ids_politicas.add(
+            str(politica["StoreId"])
+        )
 
     por_pais = {}
 
-    # La búsqueda se realiza por producto, no por categorías.
-    # Incluye todas las variantes que la API pública devuelva.
     for pais, config in PAISES.items():
         productos = obtener_json(
             config["url"]
@@ -358,14 +501,23 @@ def cargar_producto(product_id):
         items = {}
 
         for encontrado in productos:
+            if not isinstance(encontrado, dict):
+                raise ErrorConsulta(
+                    f"Producto público inválido: "
+                    f"{pais}, producto {product_id}"
+                )
+
             if (
                 str(encontrado.get("productId"))
                 != str(product_id)
             ):
                 continue
 
-            for item in encontrado.get("items", []):
-                items[str(item.get("itemId"))] = item
+            for item in encontrado.get("items") or []:
+                item_id = item.get("itemId")
+
+                if item_id is not None:
+                    items[str(item_id)] = item
 
         por_pais[pais] = items
 
@@ -378,8 +530,10 @@ def cargar_producto(product_id):
 
 def obtener_producto(product_id):
     """
-    Comparte la consulta de un producto entre sus variantes.
-    Evita repetir las cuatro búsquedas públicas por cada SKU.
+    Comparte los datos del producto entre sus SKU.
+
+    Evita consultar repetidamente el mismo producto
+    y sus cuatro contextos públicos.
     """
     clave = str(product_id)
 
@@ -393,11 +547,77 @@ def obtener_producto(product_id):
 
     if propietario:
         try:
-            futuro.set_result(cargar_producto(clave))
+            futuro.set_result(
+                cargar_producto(clave)
+            )
+
         except Exception as exc:
             futuro.set_exception(exc)
 
     return futuro.result()
+
+
+# ============================================================
+# INVENTARIO POR BODEGA
+# ============================================================
+
+def obtener_inventario(sku_id):
+    inventario = api(
+        f"/api/logistics/pvt/inventory/skus/{sku_id}"
+    )
+
+    if (
+        not isinstance(inventario, dict)
+        or not isinstance(
+            inventario.get("balance"),
+            list,
+        )
+    ):
+        raise ErrorConsulta(
+            f"Inventario inesperado para SKU {sku_id}"
+        )
+
+    detalle = []
+
+    for balance in inventario["balance"]:
+        if not isinstance(balance, dict):
+            raise ErrorConsulta(
+                f"Balance inválido para SKU {sku_id}"
+            )
+
+        total = numero(
+            balance.get("totalQuantity")
+        )
+
+        reservado = numero(
+            balance.get("reservedQuantity")
+        )
+
+        ilimitado = balance.get(
+            "hasUnlimitedQuantity"
+        )
+
+        disponible = None
+
+        # Si es ilimitado, no se representa mediante
+        # una cantidad finita disponible.
+        if (
+            ilimitado is False
+            and total is not None
+            and reservado is not None
+        ):
+            disponible = total - reservado
+
+        detalle.append({
+            "warehouse_id": balance.get("warehouseId"),
+            "warehouse_name": balance.get("warehouseName"),
+            "stock_total": total,
+            "stock_reservado": reservado,
+            "stock_disponible_calculado": disponible,
+            "stock_ilimitado": bandera(ilimitado),
+        })
+
+    return detalle
 
 
 # ============================================================
@@ -417,44 +637,79 @@ def diagnosticar(
     hallazgos = []
 
     if sku.get("IsActive") is False:
-        hallazgos.append("SKU_INACTIVO")
+        hallazgos.append(
+            "SKU_INACTIVO"
+        )
 
     if producto.get("IsActive") is False:
-        hallazgos.append("PRODUCTO_INACTIVO")
+        hallazgos.append(
+            "PRODUCTO_INACTIVO"
+        )
 
     if producto.get("IsVisible") is False:
-        hallazgos.append("PRODUCTO_NO_VISIBLE_CONFIG")
+        hallazgos.append(
+            "PRODUCTO_NO_VISIBLE_CONFIG"
+        )
 
     if contexto.get("IsBrandActive") is False:
-        hallazgos.append("MARCA_INACTIVA")
+        hallazgos.append(
+            "MARCA_INACTIVA"
+        )
 
     if contexto.get("IsDirectCategoryActive") is False:
-        hallazgos.append("CATEGORIA_INACTIVA")
+        hallazgos.append(
+            "CATEGORIA_INACTIVA"
+        )
 
     if not tiene_politica:
-        hallazgos.append("SIN_POLITICA_DEL_PAIS")
+        hallazgos.append(
+            "SIN_POLITICA_DEL_PAIS"
+        )
 
     if politica_activa is False:
-        hallazgos.append("POLITICA_INACTIVA")
+        hallazgos.append(
+            "POLITICA_INACTIVA"
+        )
 
     if item is None:
-        hallazgos.append("NO_DEVUELTO_POR_BUSQUEDA")
+        hallazgos.append(
+            "NO_DEVUELTO_POR_BUSQUEDA"
+        )
 
     elif seller is None:
-        hallazgos.append("SIN_OFERTA_SIMAN_EN_RESPUESTA")
+        hallazgos.append(
+            "SIN_OFERTA_SIMAN_EN_RESPUESTA"
+        )
 
     else:
-        cantidad = numero(offer.get("AvailableQuantity"))
-        precio = numero(offer.get("Price"))
+        cantidad = numero(
+            offer.get("AvailableQuantity")
+        )
+
+        precio = numero(
+            offer.get("Price")
+        )
 
         if offer.get("IsAvailable") is False:
-            hallazgos.append("OFERTA_NO_DISPONIBLE")
+            hallazgos.append(
+                "OFERTA_NO_DISPONIBLE"
+            )
 
-        if cantidad is not None and cantidad <= 0:
-            hallazgos.append("SIN_STOCK_EN_OFERTA")
+        if (
+            cantidad is not None
+            and cantidad <= 0
+        ):
+            hallazgos.append(
+                "SIN_STOCK_EN_OFERTA"
+            )
 
-        if precio is not None and precio <= 0:
-            hallazgos.append("PRECIO_CERO_EN_OFERTA")
+        if (
+            precio is not None
+            and precio <= 0
+        ):
+            hallazgos.append(
+                "PRECIO_CERO_EN_OFERTA"
+            )
 
         if (
             offer.get("IsAvailable") is True
@@ -465,11 +720,14 @@ def diagnosticar(
                 "OFERTA_DISPONIBLE_EN_CONTEXTO_CONSULTADO"
             )
 
-    return " | ".join(hallazgos) or "REVISAR"
+    return (
+        " | ".join(hallazgos)
+        or "REVISAR"
+    )
 
 
 # ============================================================
-# PROCESAMIENTO DE CADA SKU
+# PROCESAMIENTO DE SKU
 # ============================================================
 
 def procesar_sku(sku_id, politicas_catalogo):
@@ -491,40 +749,43 @@ def procesar_sku(sku_id, politicas_catalogo):
     sellers = contexto.get("SkuSellers") or []
 
     propios = [
-        s for s in sellers
-        if str(s.get("SellerId")) == SELLER_ID
+        seller
+        for seller in sellers
+        if str(seller.get("SellerId")) == SELLER_ID
     ]
 
-    base_identidad = {
-        "cuenta": ACCOUNT,
+    identidad = {
         "sku_id": sku_id,
         "ref_sku": sku.get("RefId"),
         "productId": sku.get("ProductId"),
-        "fecha_extraccion_utc": FECHA,
     }
 
-    # No exige que el vínculo del seller esté activo:
-    # también necesitamos los productos propios inactivos.
+    # Conserva también los vínculos propios inactivos.
     if not propios:
         if sellers:
             return {
                 "tipo": "excluido",
                 "registro": {
-                    **base_identidad,
-                    "motivo": "SOLO_SELLERS_DISTINTOS_DE_SIMAN",
+                    **identidad,
+                    "motivo": (
+                        "SOLO_SELLERS_DISTINTOS_DE_SIMAN"
+                    ),
                     "sellers_ids": "|".join(
-                        str(s.get("SellerId"))
-                        for s in sellers
+                        str(seller.get("SellerId"))
+                        for seller in sellers
                     ),
                 },
             }
 
-        # La falta de sellers no prueba que sea Marketplace.
+        # Sin seller no se puede confirmar que sea propio.
+        # Se registra como pendiente, no como Marketplace.
         return {
             "tipo": "pendiente",
             "registro": {
-                **base_identidad,
-                "motivo": "SIN_SELLERS_PARA_CONFIRMAR_ORIGEN",
+                **identidad,
+                "motivo": (
+                    "SIN_SELLERS_PARA_CONFIRMAR_ORIGEN"
+                ),
             },
         }
 
@@ -535,83 +796,51 @@ def procesar_sku(sku_id, politicas_catalogo):
             f"SKU {sku_id} sin ProductId"
         )
 
-    datos_producto = obtener_producto(product_id)
+    datos_producto = obtener_producto(
+        product_id
+    )
+
     producto = datos_producto["producto"]
     ids_politicas = datos_producto["politicas"]
 
-    inventario = api(
-        f"/api/logistics/pvt/inventory/skus/{sku_id}"
+    detalle_bodegas = obtener_inventario(
+        sku_id
     )
 
-    if (
-        not isinstance(inventario, dict)
-        or not isinstance(inventario.get("balance"), list)
-    ):
-        raise ErrorConsulta(
-            f"Inventario inesperado para SKU {sku_id}"
-        )
+    inventario_json = json.dumps(
+        detalle_bodegas,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
-    filas_bodegas = []
-
-    for balance in inventario["balance"]:
-        total = numero(balance.get("totalQuantity"))
-        reservado = numero(balance.get("reservedQuantity"))
-        ilimitado = balance.get("hasUnlimitedQuantity")
-
-        # Un inventario ilimitado no se representa como
-        # una cantidad finita disponible.
-        disponible = None
-
-        if (
-            ilimitado is False
-            and total is not None
-            and reservado is not None
-        ):
-            disponible = total - reservado
-
-        filas_bodegas.append({
-            **base_identidad,
-            "warehouse_id": balance.get("warehouseId"),
-            "warehouse_name": balance.get("warehouseName"),
-            "stock_total": total,
-            "stock_reservado": reservado,
-            "stock_disponible_calculado": disponible,
-            "stock_ilimitado": bandera(ilimitado),
-        })
+    politicas_ordenadas = ordenar_ids(
+        ids_politicas
+    )
 
     nombres_politicas = [
-        politicas_catalogo.get(pid, {}).get(
+        politicas_catalogo.get(
+            politica_id,
+            {},
+        ).get(
             "Name",
-            f"ID {pid}",
+            f"ID {politica_id}",
         )
-        for pid in sorted(ids_politicas, key=int)
+        for politica_id in politicas_ordenadas
     ]
 
     politica_columnas = {
         f"politica_{pais.lower()}": (
-            "Y" if config["sc"] in ids_politicas else "N"
+            "Y"
+            if config["sc"] in ids_politicas
+            else "N"
         )
         for pais, config in PAISES.items()
     }
 
-    filas_politicas = []
-
-    for politica_id in sorted(ids_politicas, key=int):
-        politica = politicas_catalogo.get(
-            politica_id,
-            {},
-        )
-
-        filas_politicas.append({
-            **base_identidad,
-            "politica_id": politica_id,
-            "politica_nombre": politica.get("Name"),
-            "politica_activa": bandera(
-                politica.get("IsActive")
-            ),
-        })
-
-    categorias = contexto.get("ProductCategories") or {}
+    categorias = (
+        contexto.get("ProductCategories")
+        or {}
+    )
 
     imagenes = contexto.get("Images") or []
     imagen_url = contexto.get("ImageUrl")
@@ -619,25 +848,33 @@ def procesar_sku(sku_id, politicas_catalogo):
     if not imagen_url and imagenes:
         imagen_url = imagenes[0].get("ImageUrl")
 
-    filas_catalogo = []
+    filas = []
 
     for pais, config in PAISES.items():
         sc = config["sc"]
-        item = datos_producto["publico"][pais].get(sku_id)
+
+        item = datos_producto["publico"][pais].get(
+            sku_id
+        )
 
         seller = None
 
         if item is not None:
             seller = next(
                 (
-                    s for s in item.get("sellers", [])
-                    if str(s.get("sellerId")) == SELLER_ID
+                    vendedor
+                    for vendedor in (
+                        item.get("sellers") or []
+                    )
+                    if str(
+                        vendedor.get("sellerId")
+                    ) == SELLER_ID
                 ),
                 None,
             )
 
         offer = (
-            (seller.get("commertialOffer") or {})
+            seller.get("commertialOffer") or {}
             if seller is not None
             else {}
         )
@@ -646,9 +883,8 @@ def procesar_sku(sku_id, politicas_catalogo):
             offer.get("AvailableQuantity")
         )
 
-        # Mantiene la lógica de la columna visible original:
-        # disponibilidad de la oferta + cantidad positiva.
-        # No equivale a la configuración IsVisible.
+        # Compatibilidad con la columna visible original.
+        # Representa disponibilidad de oferta, no IsVisible.
         if item is None or seller is None:
             disponible_compra = "N"
 
@@ -670,16 +906,24 @@ def procesar_sku(sku_id, politicas_catalogo):
 
         if item is None:
             estado = "NO_DEVUELTO_POR_BUSQUEDA"
+
         elif seller is None:
             estado = "SIN_OFERTA_SIMAN"
+
         elif disponible_compra == "Y":
             estado = "DISPONIBLE"
+
         elif disponible_compra == "DESCONOCIDO":
             estado = "DISPONIBILIDAD_DESCONOCIDA"
+
         else:
             estado = "OFERTA_NO_DISPONIBLE"
 
-        politica = politicas_catalogo.get(sc, {})
+        politica = politicas_catalogo.get(
+            sc,
+            {},
+        )
+
         tiene_politica = sc in ids_politicas
 
         ruta = (
@@ -690,21 +934,25 @@ def procesar_sku(sku_id, politicas_catalogo):
 
         if ruta.startswith("http"):
             link = ruta
+
         elif ruta:
             if not ruta.startswith("/"):
                 ruta = "/" + ruta + "/p"
+
             link = config["url"] + ruta
+
         else:
             link = None
 
-        filas_catalogo.append({
-            **base_identidad,
+        filas.append({
+            # Columnas originales
             "pais": pais,
             "productReference": producto.get("RefId"),
+            "productId": product_id,
             "productName": producto.get("Name"),
+            "ref_sku": sku.get("RefId"),
+            "sku_id": sku_id,
             "variante": sku.get("Name"),
-
-            # Compatibilidad con el CSV anterior
             "visible": disponible_compra,
             "estado": estado,
             "stock_sku": stock_oferta,
@@ -720,12 +968,15 @@ def procesar_sku(sku_id, politicas_catalogo):
             "link": link,
             "imagen_url": imagen_url,
 
-            # Nuevos campos de auditoría
+            # Estado administrativo
+            "cuenta": ACCOUNT,
             "seller_id": SELLER_ID,
             "seller_vinculo_activo": bandera(
                 propios[0].get("IsActive")
             ),
-            "sku_activo": bandera(sku.get("IsActive")),
+            "sku_activo": bandera(
+                sku.get("IsActive")
+            ),
             "producto_activo": bandera(
                 producto.get("IsActive")
             ),
@@ -741,32 +992,48 @@ def procesar_sku(sku_id, politicas_catalogo):
             "categoria_activa": bandera(
                 contexto.get("IsDirectCategoryActive")
             ),
+
+            # Categorías
             "categoria_id": producto.get("CategoryId"),
             "categorias": json.dumps(
                 categorias,
                 ensure_ascii=False,
+                separators=(",", ":"),
             ),
             "rutas_categorias": "|".join(
                 contexto.get("CategoriesFullPath") or []
             ),
+
+            # Consulta pública
             "aparece_busqueda": (
                 "Y" if item is not None else "N"
             ),
             "disponible_compra": disponible_compra,
+
+            # Políticas comerciales
             "politica_consultada_id": sc,
             "politica_consultada_nombre": politica.get(
                 "Name"
+            ),
+            "politica_consultada_activa": bandera(
+                politica.get("IsActive")
             ),
             "asociado_politica_pais": (
                 "Y" if tiene_politica else "N"
             ),
             "politicas_ids": "|".join(
-                sorted(ids_politicas, key=int)
+                politicas_ordenadas
             ),
             "politicas_nombres": "|".join(
                 nombres_politicas
             ),
             **politica_columnas,
+
+            # Inventario de la cuenta compartida
+            "cantidad_bodegas": len(detalle_bodegas),
+            "inventario_bodegas_json": inventario_json,
+
+            # Diagnóstico y control
             "diagnostico": diagnosticar(
                 sku,
                 producto,
@@ -777,28 +1044,24 @@ def procesar_sku(sku_id, politicas_catalogo):
                 seller,
                 offer,
             ),
+            "fecha_extraccion_utc": FECHA_INICIO,
         })
 
     return {
         "tipo": "siman",
-        "catalogo": filas_catalogo,
-        "bodegas": filas_bodegas,
-        "politicas": filas_politicas,
+        "catalogo": filas,
     }
 
 
 # ============================================================
-# EJECUCIÓN
+# EJECUCIÓN PRINCIPAL
 # ============================================================
 
 def main():
     catalogo = []
-    bodegas = []
-    asociaciones = []
     excluidos = []
     pendientes = []
     errores = []
-    politicas_filas = []
 
     ids = []
     procesados = 0
@@ -808,7 +1071,8 @@ def main():
     try:
         if not APP_KEY or not APP_TOKEN:
             raise RuntimeError(
-                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN"
+                "Faltan VTEX_APP_KEY o VTEX_APP_TOKEN "
+                "en las variables de entorno."
             )
 
         print(
@@ -827,43 +1091,49 @@ def main():
             )
 
         politicas_catalogo = {
-            str(p["Id"]): p
-            for p in politicas_filas
-            if isinstance(p, dict) and "Id" in p
+            str(politica["Id"]): politica
+            for politica in politicas_filas
+            if (
+                isinstance(politica, dict)
+                and "Id" in politica
+            )
         }
 
         for pais, config in PAISES.items():
-            if config["sc"] not in politicas_catalogo:
+            sc = config["sc"]
+
+            if sc not in politicas_catalogo:
                 raise ErrorConsulta(
-                    f"No existe la política "
-                    f"{config['sc']} configurada para {pais}"
+                    f"No existe la política {sc} "
+                    f"configurada para {pais}"
                 )
 
             print(
-                pais,
-                "política",
-                config["sc"],
-                politicas_catalogo[config["sc"]].get("Name"),
+                f"{pais}: política {sc} - "
+                f"{politicas_catalogo[sc].get('Name')}",
                 flush=True,
             )
 
         ids = obtener_todos_los_sku()
 
         print(
-            f"SKU registrados: {len(ids)}",
+            f"\nSKU registrados: {len(ids)}\n",
             flush=True,
         )
 
         with ThreadPoolExecutor(
             max_workers=MAX_WORKERS
         ) as executor:
-
-            # Procesa por lotes para no acumular todos los
-            # futuros de un catálogo grande en memoria.
             tamano_lote = MAX_WORKERS * 20
 
-            for inicio in range(0, len(ids), tamano_lote):
-                lote = ids[inicio:inicio + tamano_lote]
+            for inicio in range(
+                0,
+                len(ids),
+                tamano_lote,
+            ):
+                lote = ids[
+                    inicio:inicio + tamano_lote
+                ]
 
                 futuros = {
                     executor.submit(
@@ -883,14 +1153,9 @@ def main():
 
                         if tipo == "siman":
                             propios += 1
+
                             catalogo.extend(
                                 resultado["catalogo"]
-                            )
-                            bodegas.extend(
-                                resultado["bodegas"]
-                            )
-                            asociaciones.extend(
-                                resultado["politicas"]
                             )
 
                         elif tipo == "excluido":
@@ -907,7 +1172,6 @@ def main():
                         errores.append({
                             "sku_id": sku_id,
                             "error": str(exc),
-                            "fecha_extraccion_utc": FECHA,
                         })
 
                         print(
@@ -917,7 +1181,10 @@ def main():
 
                     procesados += 1
 
-                    if procesados % 100 == 0:
+                    if (
+                        procesados % 100 == 0
+                        or procesados == len(ids)
+                    ):
                         print(
                             f"Procesados {procesados}/"
                             f"{len(ids)}; "
@@ -931,8 +1198,9 @@ def main():
         if propios == 0:
             errores.append({
                 "sku_id": "",
-                "error": "No se confirmó ningún SKU de Siman",
-                "fecha_extraccion_utc": FECHA,
+                "error": (
+                    "No se confirmó ningún SKU de Siman"
+                ),
             })
 
         completo = (
@@ -946,78 +1214,35 @@ def main():
         errores.append({
             "sku_id": "",
             "error": str(exc),
-            "fecha_extraccion_utc": FECHA,
         })
 
-        print(f"Error general: {exc}", flush=True)
+        print(
+            f"Error general: {exc}",
+            flush=True,
+        )
 
     finally:
-        guardar_csv(
-            "catalogo_CAM.csv",
-            catalogo,
-            ["pais", "sku_id", "ref_sku"],
-        )
+        fecha_fin = datetime.now(
+            timezone.utc
+        ).isoformat()
 
-        guardar_csv(
-            "inventario_bodegas.csv",
-            bodegas,
-            [
-                "cuenta",
-                "sku_id",
-                "ref_sku",
-                "warehouse_id",
-                "warehouse_name",
-                "stock_total",
-                "stock_reservado",
-                "stock_disponible_calculado",
-                "stock_ilimitado",
-            ],
-        )
+        for fila in catalogo:
+            fila["fecha_fin_extraccion_utc"] = fecha_fin
 
-        guardar_csv(
-            "sku_politicas.csv",
-            asociaciones,
-            [
-                "cuenta",
-                "sku_id",
-                "ref_sku",
-                "politica_id",
-                "politica_nombre",
-                "politica_activa",
-            ],
-        )
+            fila["extraccion_completa"] = (
+                "Y" if completo else "N"
+            )
 
-        guardar_csv(
-            "politicas_comerciales.csv",
-            politicas_filas,
-            ["Id", "Name", "IsActive"],
-        )
-
-        guardar_csv(
-            "sku_excluidos.csv",
-            excluidos,
-            ["sku_id", "ref_sku", "motivo"],
-        )
-
-        guardar_csv(
-            "sku_pendientes.csv",
-            pendientes,
-            ["sku_id", "ref_sku", "motivo"],
-        )
-
-        guardar_csv(
-            "errores_extraccion.csv",
-            errores,
-            ["sku_id", "error", "fecha_extraccion_utc"],
+        # Único archivo generado.
+        filas_finales = guardar_catalogo(
+            catalogo
         )
 
         resumen = {
             "cuenta": ACCOUNT,
             "seller_propio": SELLER_ID,
-            "inicio_utc": FECHA,
-            "fin_utc": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "inicio_utc": FECHA_INICIO,
+            "fin_utc": fecha_fin,
             "completo": completo,
             "sku_enumerados": len(ids),
             "sku_procesados": procesados,
@@ -1025,25 +1250,13 @@ def main():
             "sku_excluidos_otros_sellers": len(excluidos),
             "sku_pendientes_clasificacion": len(pendientes),
             "consultas_con_error": len(errores),
-            "filas_catalogo_por_pais": len(catalogo),
-            "filas_inventario_bodegas": len(bodegas),
-            "filas_sku_politicas": len(asociaciones),
+            "filas_catalogo": filas_finales,
+            "archivo": ARCHIVO_SALIDA,
         }
 
-        with open(
-            "resumen_extraccion.json",
-            "w",
-            encoding="utf-8",
-        ) as archivo:
-            json.dump(
-                resumen,
-                archivo,
-                ensure_ascii=False,
-                indent=2,
-            )
-
         print(
-            json.dumps(
+            "\nRESUMEN\n"
+            + json.dumps(
                 resumen,
                 ensure_ascii=False,
                 indent=2,
@@ -1051,14 +1264,50 @@ def main():
             flush=True,
         )
 
+        # Los registros de revisión quedan en GitHub Actions,
+        # sin crear archivos adicionales.
+        for registro in pendientes:
+            print(
+                "SKU PENDIENTE: "
+                + json.dumps(
+                    registro,
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        for registro in errores:
+            print(
+                "ERROR EXTRACCION: "
+                + json.dumps(
+                    registro,
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        for pais in PAISES:
+            total = sum(
+                1
+                for fila in catalogo
+                if fila["pais"] == pais
+            )
+
+            print(
+                f"{pais}: {total} filas",
+                flush=True,
+            )
+
     if not completo:
         raise SystemExit(
-            "Extracción incompleta. Se guardaron los archivos "
-            "de revisión y no se actualizará el release latest."
+            "Extracción incompleta. Revisa el registro "
+            "de GitHub Actions. No se actualizará "
+            "el release latest."
         )
 
     print(
-        "Extracción completa. Archivos listos para publicar.",
+        f"\nExtracción completa. "
+        f"{ARCHIVO_SALIDA} listo para publicar.",
         flush=True,
     )
 
