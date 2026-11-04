@@ -482,16 +482,19 @@ def cargar_muestra():
                     f"para el SKU {sku_id}."
                 )
 
+                        politica_referencia = PAISES.get(
+                pais, {}
+            ).get("sc", "NO DEFINIDA")
+
             print(
                 f"REFERENCIA RESUELTA: "
                 f"ref_sku={referencia}; "
                 f"sku_id={sku_id}; "
                 f"product_id={contexto.get('ProductId')}; "
                 f"pais_referencia={pais}; "
-                f"politica={PAISES[pais]['sc']}",
+                f"politica={politica_referencia}",
                 flush=True,
             )
-
             muestra.append({
                 "sku_id": sku_id,
                 "binding": propio,
