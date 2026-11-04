@@ -75,9 +75,14 @@ LOCAL = threading.local()
 SESSIONS = []
 PUBLIC_LOCK = threading.Lock()
 PUBLIC_FAILURES = {p: 0 for p in PAISES}
-STATE_DIR = Path(".vtex-state")
+STATE_DIR = Path(".vtex-prueba" if SOLO_PRUEBA else ".vtex-lista-state")
 STATE_FILE = STATE_DIR / "checkpoint.sqlite"
-STATE_ARTIFACT = "vtex-estado-produccion-v1"
+INPUT_FILE = Path(os.getenv("SKU_INPUT_FILE", "data/skus_base.csv"))
+ID_CACHE = {}
+INVALID_ID_LOCK = threading.Lock()
+REQUEST_COUNT = 0
+RUN_STARTED = time.monotonic()
+STATE_ARTIFACT = "vtex-estado-lista-v1"
 RUN_ID = uuid.uuid4().hex
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(2 * 1024**3 - 16 * 1024**2)))
 WAREHOUSE_COUNTRY_MAP = json.loads(os.getenv("WAREHOUSE_COUNTRY_MAP_JSON", "{}"))
@@ -152,11 +157,12 @@ def sesion_por_hilo(privada):
 
 
 def limitar_solicitudes():
-    global ULTIMA_SOLICITUD
+    global ULTIMA_SOLICITUD, REQUEST_COUNT
     comprobar_tiempo()
     with RATE_LOCK:
         instante = max(time.monotonic(), ULTIMA_SOLICITUD)
         ULTIMA_SOLICITUD = instante + 1 / RPS
+        REQUEST_COUNT += 1
     espera = max(0, instante - time.monotonic())
     if time.monotonic() + espera >= DEADLINE:
         raise PausaExtraccion("Se guardará el avance antes de continuar.")
@@ -318,31 +324,6 @@ def cargar_producto(product_id):
     return producto, politicas
 
 
-def cargar_inventario(sku_id):
-    resultado = validar_objeto(
-        api(f"/api/logistics/pvt/inventory/skus/{sku_id}"), f"inventario {sku_id}",
-    )
-    balances = resultado.get("balance")
-    if not isinstance(balances, list):
-        raise ErrorAPI("Inventario sin balance válido.")
-    detalle = []
-    for b in balances:
-        if not isinstance(b, dict):
-            raise ErrorAPI("Balance inválido.")
-        total = numero(b.get("totalQuantity"))
-        reservado = numero(b.get("reservedQuantity"))
-        ilimitado = b.get("hasUnlimitedQuantity")
-        disponible = None
-        if ilimitado is False and total is not None and reservado is not None:
-            disponible = total - reservado
-        detalle.append({
-            "warehouse_id": b.get("warehouseId"),
-            "warehouse_name": b.get("warehouseName"),
-            "stock_total": total, "stock_reservado": reservado,
-            "stock_disponible_calculado": disponible,
-            "stock_ilimitado": bandera(ilimitado),
-        })
-    return detalle
 
 
 @lru_cache(maxsize=2048)
@@ -417,16 +398,15 @@ def procesar_sku(muestra, catalogo_politicas):
     sku_id = muestra["sku_id"]
     contexto = muestra["contexto"]
     sku = validar_objeto(api(f"/api/catalog/pvt/stockkeepingunit/{sku_id}"), f"SKU {sku_id}")
+    referencia_solicitada = muestra.get("referencia")
+    if referencia_solicitada is not None and str(sku.get("RefId") or "").strip() != referencia_solicitada:
+        raise IDInvalido("El ID guardado ya no corresponde a la referencia; se resolvera nuevamente.")
     product_id = sku.get("ProductId")
     if product_id is None:
         raise ErrorAPI("SKU sin ProductId.")
     producto, politicas = cargar_producto(product_id)
     error_inv = ""
-    try:
-        bodegas = cargar_inventario(sku_id)
-    except ErrorAPI as exc:
-        bodegas = None
-        error_inv = texto_seguro(exc)
+    bodegas = None  # Esta version no consulta inventario por bodega.
     ids = sorted(politicas, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
     nombres = [catalogo_politicas.get(x, {}).get("Name", f"ID {x}") for x in ids]
     imagenes = contexto.get("Images") or []
@@ -505,7 +485,7 @@ def procesar_sku(muestra, catalogo_politicas):
             "fuente_busqueda": r["fuente"], "error_busqueda": r["error"],
             "error_inventario": error_inv, "error_contexto": "",
             "diagnostico": " | ".join(hallazgos), "analisis": analisis,
-            "inventario_tiendas_texto": describir_inventario(bodegas, pais, error_inv),
+            "inventario_tiendas_texto": "NO CONSULTADO: VERSION SIN INVENTARIO POR BODEGA",
             "fecha_extraccion_utc": ahora(), "fecha_inicio_ciclo_utc": FECHA_INICIO,
             "extraccion_completa": "N",
         })
@@ -526,45 +506,8 @@ def guardar_csv(filas):
     os.replace(temporal, ARCHIVO)
 
 
-def formato_unidades(valor):
-    return f"{valor:g}" if valor is not None else "desconocido"
 
 
-def describir_inventario(bodegas, pais, error=""):
-    """Describe saldos registrados; no presupone que abastezcan la web."""
-    if error or bodegas is None:
-        return "INVENTARIO NO CONSULTADO: REVISAR ERROR DE CONSULTA"
-    partes, sin_pais = [], []
-    for b in bodegas:
-        nombre = str(b.get("warehouse_name") or b.get("warehouse_id") or "SIN NOMBRE")
-        identificador = str(b.get("warehouse_id") or "")
-        asignado = WAREHOUSE_COUNTRY_MAP.get(identificador)
-        if asignado is None:
-            codigos = set(re.findall(r"(?<![A-Z])(SV|GT|NI|CR)(?![A-Z])", nombre.upper()))
-            asignado = next(iter(codigos)) if len(codigos) == 1 else None
-        total = b.get("stock_total")
-        reservado = b.get("stock_reservado")
-        saldo = b.get("stock_disponible_calculado")
-        ilimitado = b.get("stock_ilimitado") == "Y"
-        # Omite bodegas cuyos saldos conocidos son cero; no omite saldos desconocidos.
-        if not ilimitado and total == 0 and reservado == 0 and saldo == 0:
-            continue
-        texto = (
-            f"{nombre}: inventario ilimitado"
-            if ilimitado else
-            f"{nombre}: {formato_unidades(total)} unidades "
-            f"(reservadas: {formato_unidades(reservado)}; "
-            f"saldo: {formato_unidades(saldo)})"
-        )
-        if asignado == pais:
-            partes.append(texto)
-        elif asignado is None:
-            sin_pais.append(texto)
-    if not partes:
-        partes.append(f"SIN UNIDADES REGISTRADAS EN BODEGAS IDENTIFICADAS DE {pais}")
-    if sin_pais:
-        partes.append("BODEGAS SIN PAIS CONFIRMADO: " + " | ".join(sin_pais))
-    return " | ".join(partes)
 
 
 # El estado es interno; Power BI sigue consumiendo solamente catalogo_CAM.csv.
@@ -647,6 +590,7 @@ def abrir_estado():
         payload BLOB, error TEXT, ultimo_run TEXT
     )""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_sku_estado ON sku(estado, id)")
+    db.execute("CREATE TABLE IF NOT EXISTS mapping (ref TEXT PRIMARY KEY, sku_id TEXT NOT NULL, verificado TEXT NOT NULL)")
     db.commit()
     return db
 
@@ -660,130 +604,12 @@ def setmeta(db, clave, valor):
     db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (clave, str(valor)))
 
 
-def preparar_ciclo(db):
-    firma = hashlib.sha256(json.dumps({
-        "schema": 1, "account": ACCOUNT, "seller": SELLER_ID,
-        "countries": PAISES, "warehouse_map": WAREHOUSE_COUNTRY_MAP,
-        "columns": COLUMNAS,
-    }, sort_keys=True).encode()).hexdigest()
-    if meta(db, "firma") not in (None, firma):
-        raise RuntimeError("El avance usa otra configuración. Revisa y ejecuta con reiniciar=true.")
-    if meta(db, "publicado") == "1":
-        with db:
-            db.execute("DELETE FROM sku")
-            db.execute("DELETE FROM meta")
-    with db:
-        setmeta(db, "firma", firma)
-        if not meta(db, "inicio"):
-            setmeta(db, "inicio", ahora())
 
 
-def enumerar_catalogo(db):
-    if meta(db, "enumerado") == "1":
-        return
-    pagina = int(meta(db, "pagina", "1"))
-    while True:
-        comprobar_tiempo()
-        resultado = api(
-            "/api/catalog_system/pvt/sku/stockkeepingunitids",
-            params={"page": pagina, "pagesize": 1000},
-        )
-        if not isinstance(resultado, list):
-            raise ErrorAPI("El listado administrativo no devolvió una lista.")
-        if not resultado:
-            with db:
-                setmeta(db, "enumerado", "1")
-            print("Enumeración administrativa completada.", flush=True)
-            return
-        ids = []
-        for valor in resultado:
-            if isinstance(valor, bool) or not isinstance(valor, (str, int)) or not str(valor).isdigit():
-                raise ErrorAPI("El listado contiene un ID inválido.")
-            ids.append(str(valor))
-        with db:
-            antes = db.total_changes
-            db.executemany("INSERT OR IGNORE INTO sku(id) VALUES (?)", ((x,) for x in ids))
-            nuevos = db.total_changes - antes
-            if nuevos == 0:
-                raise ErrorAPI("La paginación repitió una página completa; no se declarará completo.")
-            setmeta(db, "pagina", pagina + 1)
-        if pagina == 1 or pagina % 25 == 0:
-            total = db.execute("SELECT COUNT(*) FROM sku").fetchone()[0]
-            print(f"Enumeración: página {pagina}; {total} SKU únicos.", flush=True)
-        pagina += 1
 
 
-def resolver_sku(sku_id, politicas):
-    contexto = validar_objeto(
-        api(f"/api/catalog_system/pvt/sku/stockkeepingunitbyid/{sku_id}"),
-        f"contexto del SKU {sku_id}",
-    )
-    sellers = contexto.get("SkuSellers") or []
-    if not isinstance(sellers, list) or any(not isinstance(s, dict) or s.get("SellerId") is None for s in sellers):
-        raise ErrorAPI("Información de sellers inválida.")
-    propio = next((s for s in sellers if str(s.get("SellerId")) == SELLER_ID), None)
-    if propio is None:
-        if sellers:
-            return 2, [], ""  # Otros sellers: fuera del alcance solicitado.
-        raise ErrorAPI("SIN SELLER: no se puede confirmar si el SKU pertenece a Siman.")
-    filas, errores = procesar_sku({
-        "sku_id": sku_id, "binding": propio, "contexto": contexto,
-    }, politicas)
-    return (3 if errores else 1), filas, texto_seguro(" | ".join(errores))
 
 
-def recorrer_catalogo(db, politicas):
-    intentados = 0
-    consecutivos = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        while True:
-            comprobar_tiempo()
-            # Cada SKU fallido se vuelve a intentar en una ejecución posterior.
-            lote = db.execute("""
-                SELECT id FROM sku
-                WHERE estado IN (0,3) AND COALESCE(ultimo_run,'') != ?
-                ORDER BY estado DESC, id LIMIT ?
-            """, (RUN_ID, WORKERS)).fetchall()
-            if not lote:
-                return
-            futuros = {executor.submit(resolver_sku, x[0], politicas): x[0] for x in lote}
-            pausar = False
-            for futuro in as_completed(futuros):
-                sku_id = futuros[futuro]
-                try:
-                    estado, filas, error = futuro.result()
-                    payload = zlib.compress(json.dumps(filas, ensure_ascii=False).encode()) if filas else None
-                    with db:
-                        db.execute(
-                            "UPDATE sku SET estado=?,payload=?,error=?,ultimo_run=? WHERE id=?",
-                            (estado, payload, error, RUN_ID, sku_id),
-                        )
-                    consecutivos = consecutivos + 1 if estado == 3 else 0
-                    if error:
-                        print(f"ERROR SKU {sku_id}: {error}", flush=True)
-                except PausaExtraccion:
-                    pausar = True
-                except Exception as exc:
-                    error = texto_seguro(exc)
-                    consecutivos += 1
-                    with db:
-                        # Conserva el payload administrativo anterior si existe.
-                        db.execute(
-                            "UPDATE sku SET estado=3,error=?,ultimo_run=? WHERE id=?",
-                            (error, RUN_ID, sku_id),
-                        )
-                    print(f"ERROR SKU {sku_id}: {error}", flush=True)
-                intentados += 1
-            if intentados % 100 < WORKERS:
-                print(f"Procesados en esta ejecución: {intentados}; estados: {estadisticas(db)}", flush=True)
-            with PUBLIC_LOCK:
-                circuito = any(x >= 3 for x in PUBLIC_FAILURES.values())
-            if circuito or consecutivos >= 5:
-                raise ErrorAPI("Errores repetidos: se detiene la extracción conservando el avance.")
-            if pausar:
-                raise PausaExtraccion("Continuará en la próxima ejecución.")
-            if shutil.disk_usage(STATE_DIR).free < 3 * 1024**3:
-                raise RuntimeError("Espacio de trabajo insuficiente. No se publicará un CSV parcial.")
 
 
 def estadisticas(db):
@@ -791,7 +617,7 @@ def estadisticas(db):
     return {
         "sku_enumerados": sum(datos.values()), "sku_pendientes": datos.get(0, 0),
         "sku_siman_completos": datos.get(1, 0), "sku_otros_sellers": datos.get(2, 0),
-        "sku_con_error_o_sin_clasificar": datos.get(3, 0),
+        "sku_con_error_o_sin_clasificar": datos.get(3, 0), "referencias_no_encontradas": datos.get(4, 0),
     }
 
 
@@ -817,7 +643,7 @@ def exportar_estado(db, completo):
                 for fila in json.loads(zlib.decompress(payload)):
                     fila["fecha_inicio_ciclo_utc"] = inicio
                     fila["fecha_fin_exportacion_utc"] = fin
-                    fila["extraccion_completa"] = "Y" if completo else "N"
+                    fila["extraccion_completa"] = "Y" if completo and not SOLO_PRUEBA else "N"
                     escritor.writerow(fila)
                     filas += 1
                     if archivo.tell() >= MAX_CSV_BYTES:
@@ -829,29 +655,181 @@ def exportar_estado(db, completo):
     return filas
 
 
-def ejecutar_prueba(politicas):
-    filas, errores = [], []
-    for muestra in cargar_muestra():
-        nuevas, problemas = procesar_sku(muestra, politicas)
-        filas.extend(nuevas)
-        errores.extend(problemas)
-    guardar_csv(filas)
-    print(f"PRUEBA: {len(filas)} filas; {len(errores)} errores. No se publica latest.", flush=True)
-    if errores:
-        raise ErrorAPI("La prueba presentó errores de consulta.")
+class IDInvalido(ErrorAPI):
+    pass
+
+
+def leer_base():
+    if not INPUT_FILE.is_file():
+        raise RuntimeError(f"No existe {INPUT_FILE}. Sube el CSV al repositorio.")
+    with INPUT_FILE.open(encoding="utf-8-sig", newline="") as f:
+        cabecera = f.readline()
+        f.seek(0)
+        delimitador = next((d for d in (";", ",", "\t", "|") if d in cabecera), ",")
+        lector = csv.DictReader(f, delimiter=delimitador)
+        if not lector.fieldnames or "SKU_ITEM_NBR" not in lector.fieldnames:
+            raise RuntimeError("El CSV debe tener una columna llamada SKU_ITEM_NBR.")
+        referencias = set()
+        for linea, fila in enumerate(lector, 2):
+            if None in fila:
+                raise RuntimeError(f"Fila {linea}: columnas inesperadas en el CSV.")
+            valor = (fila.get("SKU_ITEM_NBR") or "").strip()
+            if not valor:
+                continue
+            if re.fullmatch(r"[+-]?\d+(?:\.\d+)?[eE][+-]?\d+", valor):
+                raise RuntimeError(f"Fila {linea}: codigo en notacion cientifica. Reexporta como texto.")
+            referencias.add(valor)
+    if not referencias:
+        raise RuntimeError("La lista de referencias esta vacia.")
+    referencias = sorted(referencias)
+    if SOLO_PRUEBA:
+        limite = max(4, int(os.getenv("TEST_LIMIT", "100")))
+        controles = [m["referencia"] for m in MUESTRAS if m["referencia"] in referencias]
+        referencias = (controles + [x for x in referencias if x not in set(controles)])[:limite]
+    firma = hashlib.sha256(json.dumps(referencias, ensure_ascii=False).encode()).hexdigest()
+    print(f"BASE: {INPUT_FILE}; {len(referencias)} referencias unicas; prueba={SOLO_PRUEBA}.", flush=True)
+    return referencias, firma
+
+
+def preparar_lista(db, referencias, firma_base):
+    firma = hashlib.sha256(json.dumps({
+        "version": 1, "cuenta": ACCOUNT, "seller": SELLER_ID,
+        "paises": PAISES, "columnas": COLUMNAS,
+    }, sort_keys=True).encode()).hexdigest()
+    if meta(db, "firma") not in (None, firma):
+        raise RuntimeError("Cambio la configuracion. Ejecuta reiniciar para empezar un ciclo nuevo.")
+    cambio_base = meta(db, "base") not in (None, firma_base)
+    if cambio_base or meta(db, "publicado") == "1" or SOLO_PRUEBA:
+        with db:
+            db.execute("DELETE FROM sku")
+            db.execute("DELETE FROM meta")
+        print("Comienza un ciclo nuevo; se conservan los ID positivos guardados.", flush=True)
+    with db:
+        setmeta(db, "firma", firma)
+        setmeta(db, "base", firma_base)
+        if not meta(db, "inicio"):
+            setmeta(db, "inicio", ahora())
+        db.executemany("INSERT OR IGNORE INTO sku(id) VALUES (?)", ((x,) for x in referencias))
+        setmeta(db, "enumerado", "1")
+    # Revalida los ID una vez por semana; verifica RefId cada vez que consulta el SKU.
+    desde = datetime.fromtimestamp(time.time() - 7 * 86400, timezone.utc).isoformat()
+    ID_CACHE.clear()
+    ID_CACHE.update(db.execute("SELECT ref,sku_id FROM mapping WHERE verificado>=?", (desde,)).fetchall())
+    print(f"ID reutilizables en memoria: {len(ID_CACHE)}.", flush=True)
+
+
+def filas_no_encontrado(referencia):
+    filas = []
+    for pais, config in PAISES.items():
+        fila = {k: None for k in COLUMNAS}
+        fila.update({
+            "pais": pais, "ref_sku": referencia, "cuenta": ACCOUNT,
+            "visible": "DESCONOCIDO", "aparece_busqueda": "DESCONOCIDO",
+            "disponible_compra": "DESCONOCIDO", "es_propio": "NO CONFIRMADO",
+            "estado": "REFERENCIA_NO_ENCONTRADA", "politica_consultada_id": config["sc"],
+            "diagnostico": "NO_ENCONTRADO_POR_REFERENCIA",
+            "analisis": "NO ENCONTRADO POR REFERENCIA: REVISAR CODIGO O ALTA EN VTEX",
+            "inventario_tiendas_texto": "NO CONSULTADO: VERSION SIN INVENTARIO POR BODEGA",
+            "fecha_extraccion_utc": ahora(), "extraccion_completa": "N",
+        })
+        filas.append(fila)
+    return filas
+
+
+def resolver_referencia(referencia, politicas):
+    sku_id = ID_CACHE.get(referencia)
+    if sku_id is None:
+        try:
+            valor = api("/api/catalog_system/pvt/sku/stockkeepingunitidbyrefid/" + quote(referencia, safe=""))
+        except ErrorAPI as exc:
+            if exc.status == 404:
+                return 4, filas_no_encontrado(referencia), "", None
+            raise
+        if isinstance(valor, bool) or not isinstance(valor, (str, int)) or not str(valor).strip().isdigit():
+            raise ErrorAPI("La consulta de referencia no devolvio un ID valido.")
+        sku_id = str(valor).strip()
+    try:
+        contexto = validar_objeto(
+            api(f"/api/catalog_system/pvt/sku/stockkeepingunitbyid/{sku_id}"), f"contexto {sku_id}",
+        )
+    except ErrorAPI as exc:
+        if exc.status == 404 and referencia in ID_CACHE:
+            raise IDInvalido("El ID guardado devolvio 404; se resolvera de nuevo en la proxima ejecucion.") from exc
+        raise
+    sellers = contexto.get("SkuSellers") or []
+    if not isinstance(sellers, list) or any(not isinstance(s, dict) or s.get("SellerId") is None for s in sellers):
+        raise ErrorAPI("Información de sellers invalida.")
+    propio = next((s for s in sellers if str(s.get("SellerId")) == SELLER_ID), None)
+    if propio is None:
+        if sellers:
+            return 2, [], "", None
+        raise ErrorAPI("No se pudo confirmar si la referencia pertenece a Siman.")
+    filas, errores = procesar_sku({
+        "sku_id": sku_id, "referencia": referencia, "binding": propio, "contexto": contexto,
+    }, politicas)
+    return (3 if errores else 1), filas, texto_seguro(" | ".join(errores)), sku_id
+
+
+def recorrer_lista(db, politicas):
+    intentados = consecutivos = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        while True:
+            comprobar_tiempo()
+            lote = db.execute("""
+                SELECT id FROM sku WHERE estado IN (0,3) AND COALESCE(ultimo_run,'') != ?
+                ORDER BY estado DESC,id LIMIT ?
+            """, (RUN_ID, WORKERS)).fetchall()
+            if not lote:
+                return
+            futuros = {executor.submit(resolver_referencia, x[0], politicas): x[0] for x in lote}
+            pausar = False
+            for futuro in as_completed(futuros):
+                ref = futuros[futuro]
+                try:
+                    estado, filas, error, sku_id = futuro.result()
+                    payload = zlib.compress(json.dumps(filas, ensure_ascii=False).encode()) if filas else None
+                    with db:
+                        db.execute("UPDATE sku SET estado=?,payload=?,error=?,ultimo_run=? WHERE id=?",
+                                   (estado, payload, error, RUN_ID, ref))
+                        if sku_id:
+                            db.execute("INSERT OR REPLACE INTO mapping VALUES (?,?,?)", (ref, sku_id, ahora()))
+                    consecutivos = consecutivos + 1 if estado == 3 else 0
+                    if error:
+                        print(f"ERROR REFERENCIA {ref}: {error}", flush=True)
+                except PausaExtraccion:
+                    pausar = True
+                except Exception as exc:
+                    consecutivos += 1
+                    error = texto_seguro(exc)
+                    with db:
+                        if isinstance(exc, IDInvalido):
+                            db.execute("DELETE FROM mapping WHERE ref=?", (ref,))
+                            ID_CACHE.pop(ref, None)
+                        db.execute("UPDATE sku SET estado=3,error=?,ultimo_run=? WHERE id=?", (error, RUN_ID, ref))
+                    print(f"ERROR REFERENCIA {ref}: {error}", flush=True)
+                intentados += 1
+            if intentados % 100 < WORKERS or SOLO_PRUEBA:
+                print(f"Avance del lote: {intentados}; {estadisticas(db)}", flush=True)
+            with PUBLIC_LOCK:
+                circuito = any(x >= 3 for x in PUBLIC_FAILURES.values())
+            if circuito or consecutivos >= 5:
+                raise ErrorAPI("Errores repetidos. Se conserva el avance y no se publica un archivo parcial.")
+            if pausar:
+                raise PausaExtraccion("Continuara con la proxima ejecucion.")
+            if shutil.disk_usage(STATE_DIR).free < 3 * 1024**3:
+                raise RuntimeError("Espacio de trabajo insuficiente.")
 
 
 def main():
     if "--confirmar-publicacion" in sys.argv:
         if not STATE_FILE.exists():
-            raise SystemExit("No existe el avance que se va a confirmar.")
+            raise SystemExit("No existe el avance a confirmar.")
         db = abrir_estado()
         try:
             if not ciclo_completo(db) or meta(db, "listo") != "1":
-                raise RuntimeError("El ciclo no está completo para confirmar su publicación.")
+                raise RuntimeError("El ciclo no esta completo.")
             with db:
                 setmeta(db, "publicado", "1")
-            print("Publicación confirmada. La siguiente ejecución iniciará un ciclo nuevo.", flush=True)
         finally:
             db.close()
         return
@@ -860,21 +838,18 @@ def main():
     db = None
     fallo = False
     try:
+        referencias, firma_base = leer_base()
         if not APP_KEY or not APP_TOKEN:
             raise RuntimeError("Faltan VTEX_APP_KEY o VTEX_APP_TOKEN.")
-        print(f"Cuenta={ACCOUNT}; seller={SELLER_ID}; hilos={WORKERS}; máximo={RPS} solicitudes/s.", flush=True)
+        if not SOLO_PRUEBA:
+            restaurar_estado()
+        db = abrir_estado()
+        preparar_lista(db, referencias, firma_base)
         politicas = cargar_politicas()
         for pais, config in PAISES.items():
             if politicas[config["sc"]].get("IsActive") is not True:
-                raise ErrorAPI(f"La política configurada para {pais} no está activa.")
-        if SOLO_PRUEBA:
-            ejecutar_prueba(politicas)
-            return
-        restaurar_estado()
-        db = abrir_estado()
-        preparar_ciclo(db)
-        enumerar_catalogo(db)
-        recorrer_catalogo(db, politicas)
+                raise ErrorAPI(f"Politica de {pais} inactiva.")
+        recorrer_lista(db, politicas)
     except PausaExtraccion as exc:
         print(f"PAUSA: {exc}", flush=True)
     except Exception as exc:
@@ -883,19 +858,22 @@ def main():
     finally:
         try:
             if db is not None:
-                completo = ciclo_completo(db) and not fallo
-                filas = exportar_estado(db, completo)
+                terminado = ciclo_completo(db) and not fallo
+                filas = exportar_estado(db, terminado)
+                publicar = terminado and not SOLO_PRUEBA
                 with db:
-                    setmeta(db, "listo", "1" if completo else "0")
+                    setmeta(db, "listo", "1" if publicar else "0")
+                segundos = max(1, time.monotonic() - RUN_STARTED)
                 print("\nRESUMEN\n" + json.dumps({
-                    **estadisticas(db), "enumeracion_completa": meta(db, "enumerado") == "1",
-                    "filas_csv": filas, "extraccion_completa": completo,
+                    **estadisticas(db), "filas_csv": filas, "solo_prueba": SOLO_PRUEBA,
+                    "extraccion_completa": publicar, "solicitudes_en_ejecucion": REQUEST_COUNT,
+                    "duracion_segundos": round(segundos, 1), "archivo_base": str(INPUT_FILE),
                     "inicio_ciclo": meta(db, "inicio"), "fin_ejecucion": ahora(),
                 }, ensure_ascii=False, indent=2), flush=True)
-                if completo:
+                if publicar:
                     salida_github("publicar", "true")
                 else:
-                    print("Latest no cambia. El siguiente trabajo retomará este ciclo.", flush=True)
+                    print("No se reemplaza latest. Se conserva el avance de produccion.", flush=True)
         finally:
             if db is not None:
                 db.close()
@@ -904,9 +882,13 @@ def main():
             for s in SESSIONS:
                 s.close()
     if fallo:
-        raise SystemExit("Extracción detenida. Revisa el registro; no se publicará un archivo parcial.")
+        raise SystemExit("Extraccion detenida. Revisa el registro.")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
