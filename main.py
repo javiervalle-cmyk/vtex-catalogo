@@ -402,42 +402,35 @@ def cargar_politicas():
 # ============================================================
 
 def cargar_muestra():
-    print(
-        "\nPRUEBA: consultando únicamente "
-        "tres ID administrativos.",
-        flush=True,
-    )
-
-    ids = api(
-        "/api/catalog_system/pvt/sku/stockkeepingunitids",
-        params={
-            "page": 1,
-            "pagesize": MAX_SKU_PRUEBA,
+    muestras_conocidas = [
+        {
+            "sku_id": "105062291",
+            "pais_esperado": "SV",
         },
-    )
-
-    if not isinstance(ids, list) or not ids:
-        raise ErrorAPI(
-            "El catálogo administrativo no devolvió "
-            "una lista válida de ID."
-        )
-
-    ids = ids[:MAX_SKU_PRUEBA]
+        {
+            "sku_id": "104631517",
+            "pais_esperado": "NI",
+        },
+    ]
 
     print(
-        f"PRUEBA: ID recibidos={ids}",
+        "\nPRUEBA: consultando los dos SKU "
+        "proporcionados por Javier.",
         flush=True,
     )
 
     muestra = []
 
-    for valor in ids:
-        sku_id = str(valor)
+    for registro in muestras_conocidas:
+        sku_id = registro["sku_id"]
+        pais_esperado = registro["pais_esperado"]
 
-        if not sku_id.isdigit():
-            raise ErrorAPI(
-                "El listado contiene un ID inválido."
-            )
+        print(
+            f"PRUEBA POSITIVA ESPERADA: "
+            f"SKU={sku_id}; pais={pais_esperado}; "
+            f"politica={PAISES[pais_esperado]['sc']}",
+            flush=True,
+        )
 
         contexto = validar_objeto(
             api(
@@ -479,17 +472,17 @@ def cargar_muestra():
             None,
         )
 
-        if propio is not None:
-            muestra.append({
-                "sku_id": sku_id,
-                "binding": propio,
-                "contexto": contexto,
-            })
+        if propio is None:
+            raise ErrorAPI(
+                f"No se confirmó el seller {SELLER_ID} "
+                f"para el SKU {sku_id}."
+            )
 
-    if not muestra:
-        raise ErrorAPI(
-            "La muestra no contiene SKU propios confirmados."
-        )
+        muestra.append({
+            "sku_id": sku_id,
+            "binding": propio,
+            "contexto": contexto,
+        })
 
     return muestra
 
