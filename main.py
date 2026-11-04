@@ -65,6 +65,10 @@ MUESTRAS = [
         "referencia": "105360348",
         "pais_esperado": "SV",
     },
+    {
+        "referencia": "104772495",
+        "pais_esperado": "POR CONFIRMAR",
+    },
 ]
 
 COLUMNAS = [
