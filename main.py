@@ -402,87 +402,124 @@ def cargar_politicas():
 # ============================================================
 
 def cargar_muestra():
+    from urllib.parse import quote
+
     muestras_conocidas = [
         {
-            "sku_id": "105062291",
+            "referencia": "105062291",
             "pais_esperado": "SV",
         },
         {
-            "sku_id": "104631517",
+            "referencia": "104631517",
             "pais_esperado": "NI",
         },
     ]
 
+    muestra = []
+    errores = []
+
     print(
-        "\nPRUEBA: consultando los dos SKU "
-        "proporcionados por Javier.",
+        "\nPRUEBA: resolviendo referencias "
+        "a ID internos de VTEX.",
         flush=True,
     )
 
-    muestra = []
-
     for registro in muestras_conocidas:
-        sku_id = registro["sku_id"]
-        pais_esperado = registro["pais_esperado"]
+        referencia = registro["referencia"]
+        pais = registro["pais_esperado"]
 
-        print(
-            f"PRUEBA POSITIVA ESPERADA: "
-            f"SKU={sku_id}; pais={pais_esperado}; "
-            f"politica={PAISES[pais_esperado]['sc']}",
-            flush=True,
-        )
-
-        contexto = validar_objeto(
-            api(
+        try:
+            resultado = api(
                 "/api/catalog_system/pvt/sku/"
-                f"stockkeepingunitbyid/{sku_id}"
-            ),
-            f"contexto del SKU {sku_id}",
-        )
-
-        sellers = contexto.get("SkuSellers") or []
-
-        if not isinstance(sellers, list):
-            raise ErrorAPI(
-                f"SkuSellers inválido para SKU {sku_id}."
+                "stockkeepingunitidbyrefid/"
+                + quote(referencia, safe="")
             )
 
-        sellers_ids = [
-            str(seller.get("SellerId"))
-            for seller in sellers
-            if isinstance(seller, dict)
-        ]
-
-        print(
-            f"PRUEBA SKU={sku_id}; "
-            f"sellers={sellers_ids}",
-            flush=True,
-        )
-
-        propio = next(
-            (
-                seller
-                for seller in sellers
-                if (
-                    isinstance(seller, dict)
-                    and str(seller.get("SellerId"))
-                    == SELLER_ID
+            if (
+                isinstance(resultado, bool)
+                or not isinstance(resultado, (str, int))
+            ):
+                raise ErrorAPI(
+                    "La consulta por referencia devolvió "
+                    "un formato inesperado."
                 )
-            ),
-            None,
-        )
 
-        if propio is None:
-            raise ErrorAPI(
-                f"No se confirmó el seller {SELLER_ID} "
-                f"para el SKU {sku_id}."
+            sku_id = str(resultado).strip()
+
+            if not sku_id.isdigit():
+                raise ErrorAPI(
+                    "La consulta por referencia no devolvió "
+                    "un ID interno válido."
+                )
+
+            contexto = validar_objeto(
+                api(
+                    "/api/catalog_system/pvt/sku/"
+                    f"stockkeepingunitbyid/{sku_id}"
+                ),
+                f"contexto del SKU {sku_id}",
             )
 
-        muestra.append({
-            "sku_id": sku_id,
-            "binding": propio,
-            "contexto": contexto,
-        })
+            sellers = contexto.get("SkuSellers") or []
+
+            if not isinstance(sellers, list):
+                raise ErrorAPI(
+                    f"SkuSellers inválido para SKU {sku_id}."
+                )
+
+            propio = next(
+                (
+                    seller
+                    for seller in sellers
+                    if (
+                        isinstance(seller, dict)
+                        and str(seller.get("SellerId"))
+                        == SELLER_ID
+                    )
+                ),
+                None,
+            )
+
+            if propio is None:
+                raise ErrorAPI(
+                    f"No se confirmó el seller {SELLER_ID} "
+                    f"para el SKU interno {sku_id}."
+                )
+
+            print(
+                f"REFERENCIA RESUELTA: "
+                f"ref_sku={referencia}; "
+                f"sku_id={sku_id}; "
+                f"product_id={contexto.get('ProductId')}; "
+                f"pais_esperado={pais}; "
+                f"politica={PAISES[pais]['sc']}",
+                flush=True,
+            )
+
+            muestra.append({
+                "sku_id": sku_id,
+                "binding": propio,
+                "contexto": contexto,
+            })
+
+        except ErrorAPI as exc:
+            detalle = (
+                f"Referencia {referencia}, país {pais}: "
+                f"{texto_seguro(exc)}"
+            )
+
+            errores.append(detalle)
+
+            print(
+                f"ERROR REFERENCIA: {detalle}",
+                flush=True,
+            )
+
+    if errores:
+        raise ErrorAPI(
+            "No se pudieron resolver ambas referencias. "
+            "Revisa las líneas ERROR REFERENCIA."
+        )
 
     return muestra
 
