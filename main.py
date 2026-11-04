@@ -457,8 +457,8 @@ def cargar_sku_siman(db):
         flush=True,
     )
 
-    bindings = api(
-        "/sku-binding/pvt/skuseller/list/"
+      bindings = api(
+        "/api/sku-binding/pvt/skuseller/list/"
         f"bysellerId/{SELLER_ID}"
     )
 
