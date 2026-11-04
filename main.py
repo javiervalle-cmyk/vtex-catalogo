@@ -168,8 +168,10 @@ def ahora():
 def bandera(valor):
     if valor is True:
         return "Y"
+
     if valor is False:
         return "N"
+
     return "DESCONOCIDO"
 
 
@@ -190,7 +192,11 @@ def texto_seguro(valor):
         if secreto:
             texto = texto.replace(secreto, "[OCULTO]")
 
-    return texto.replace("\r", " ").replace("\n", " ")[:700]
+    return (
+        texto
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )[:700]
 
 
 def revisar_tiempo():
@@ -224,7 +230,10 @@ def limitar_solicitudes():
 
         PROXIMA_SOLICITUD = instante + 1 / RPS
 
-    esperar(max(0, instante - time.monotonic()))
+    esperar(
+        max(0, instante - time.monotonic())
+    )
+
     revisar_tiempo()
 
 
@@ -232,20 +241,20 @@ def sesion(privada):
     nombre = "privada" if privada else "publica"
 
     if not hasattr(LOCAL, nombre):
-        s = requests.Session()
+        nueva = requests.Session()
 
-        s.headers.update({
+        nueva.headers.update({
             "Accept": "application/json",
-            "User-Agent": "Siman-Catalogo-Auditoria/4.0",
+            "User-Agent": "Siman-Catalogo-Auditoria/4.1",
         })
 
         if privada:
-            s.headers.update({
+            nueva.headers.update({
                 "X-VTEX-API-AppKey": APP_KEY,
                 "X-VTEX-API-AppToken": APP_TOKEN,
             })
 
-        setattr(LOCAL, nombre, s)
+        setattr(LOCAL, nombre, nueva)
 
     return getattr(LOCAL, nombre)
 
@@ -260,6 +269,7 @@ def retry_after(respuesta, intento):
     if valor:
         try:
             return max(0, float(valor))
+
         except ValueError:
             try:
                 return max(
@@ -267,10 +277,18 @@ def retry_after(respuesta, intento):
                     parsedate_to_datetime(valor).timestamp()
                     - time.time(),
                 )
-            except (ValueError, TypeError, OverflowError):
+
+            except (
+                ValueError,
+                TypeError,
+                OverflowError,
+            ):
                 pass
 
-    return min(60, 2 ** (intento + 1)) + random.random()
+    return (
+        min(60, 2 ** (intento + 1))
+        + random.random()
+    )
 
 
 def obtener_json(url, privada=False, params=None):
@@ -278,6 +296,7 @@ def obtener_json(url, privada=False, params=None):
 
     for intento in range(MAX_REINTENTOS):
         limitar_solicitudes()
+
         respuesta = None
         status = None
 
@@ -294,17 +313,25 @@ def obtener_json(url, privada=False, params=None):
             if status == 200:
                 try:
                     return respuesta.json()
+
                 except ValueError:
-                    detalle = "La respuesta no contiene JSON válido."
+                    detalle = (
+                        "La respuesta no contiene JSON válido; "
+                        f"URL={respuesta.url}; "
+                        f"respuesta={texto_seguro(respuesta.text)}"
+                    )
 
             else:
                 detalle = (
-                    f"HTTP {status}; URL={respuesta.url}; "
+                    f"HTTP {status}; "
+                    f"URL={respuesta.url}; "
                     f"respuesta={texto_seguro(respuesta.text)}"
                 )
 
-                # Los 400 no se repiten automáticamente.
-                if status not in (408, 429) and status < 500:
+                if (
+                    status not in (408, 429)
+                    and status < 500
+                ):
                     raise ErrorAPI(detalle, status)
 
         except requests.RequestException as exc:
@@ -316,10 +343,12 @@ def obtener_json(url, privada=False, params=None):
         if intento == MAX_REINTENTOS - 1:
             raise ErrorAPI(detalle, status)
 
-        demora = retry_after(respuesta, intento)
+        demora = retry_after(
+            respuesta,
+            intento,
+        )
 
         if status == 429:
-            # Aplica la pausa a todos los hilos.
             with LOCK_RATE:
                 PROXIMA_SOLICITUD = max(
                     PROXIMA_SOLICITUD,
@@ -359,7 +388,10 @@ def objeto(valor, nombre):
 # ============================================================
 
 def abrir_estado():
-    ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    ESTADO.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     db = sqlite3.connect(ESTADO)
 
@@ -427,7 +459,6 @@ def preparar_ciclo(db):
             "Ejecuta el flujo con reiniciar=true."
         )
 
-    # Después de publicar un ciclo completo, comienza uno nuevo.
     if leer_meta(db, "completo") == "1":
         db.execute("DELETE FROM sku")
         db.execute("DELETE FROM meta")
@@ -439,6 +470,10 @@ def preparar_ciclo(db):
 
     db.commit()
 
+
+# ============================================================
+# LISTADO DEL SELLER Y DIAGNÓSTICO
+# ============================================================
 
 def cargar_sku_siman(db):
     if leer_meta(db, "listado_completo") == "1":
@@ -452,31 +487,84 @@ def cargar_sku_siman(db):
         )
         return
 
+    ruta = (
+        "/api/sku-binding/pvt/skuseller/list/"
+        f"bysellerId/{SELLER_ID}"
+    )
+
     print(
         f"Consultando vínculos del seller {SELLER_ID}...",
         flush=True,
     )
 
-    bindings = api(
-        "/api/sku-binding/pvt/skuseller/list/"
-        f"bysellerId/{SELLER_ID}"
+    print(
+        f"DIAGNOSTICO SELLER: endpoint={BASE + ruta}",
+        flush=True,
     )
 
-    if not isinstance(bindings, list) or not bindings:
+    bindings = api(ruta)
+
+    print(
+        "DIAGNOSTICO SELLER: "
+        f"tipo={type(bindings).__name__}",
+        flush=True,
+    )
+
+    if isinstance(bindings, list):
+        print(
+            "DIAGNOSTICO SELLER: "
+            f"registros={len(bindings)}",
+            flush=True,
+        )
+
+        if not bindings:
+            raise ErrorAPI(
+                f"VTEX devolvió una lista vacía para el seller "
+                f"{SELLER_ID}. Este endpoint no proporciona "
+                "un listado utilizable de productos propios "
+                "en esta consulta. No se publicará el CSV."
+            )
+
+        primero = bindings[0]
+
+        print(
+            "DIAGNOSTICO SELLER: campos del primer registro="
+            + str(
+                list(primero.keys())
+                if isinstance(primero, dict)
+                else type(primero).__name__
+            ),
+            flush=True,
+        )
+
+    else:
+        print(
+            "DIAGNOSTICO SELLER: campos de respuesta="
+            + str(
+                list(bindings.keys())
+                if isinstance(bindings, dict)
+                else "No es un objeto ni una lista"
+            ),
+            flush=True,
+        )
+
         raise ErrorAPI(
-            "El listado del seller está vacío o tiene "
-            "un formato inesperado. No se publicará."
+            "El endpoint devolvió una estructura distinta "
+            "a la lista esperada. No se publicará el CSV."
         )
 
     registros = {}
 
     for binding in bindings:
         if not isinstance(binding, dict):
-            raise ErrorAPI("Vínculo de seller inválido.")
+            raise ErrorAPI(
+                "Vínculo de seller inválido."
+            )
 
         if str(binding.get("SellerId")) != SELLER_ID:
             raise ErrorAPI(
-                "La API devolvió un seller distinto al solicitado."
+                "La API devolvió un seller distinto "
+                "al solicitado."
             )
 
         sku_id = str(
@@ -494,8 +582,10 @@ def cargar_sku_siman(db):
 
     with db:
         db.executemany(
-            "INSERT OR IGNORE INTO sku "
-            "(id, binding) VALUES (?, ?)",
+            """
+            INSERT OR IGNORE INTO sku (id, binding)
+            VALUES (?, ?)
+            """,
             (
                 (
                     sku_id,
@@ -519,6 +609,7 @@ def cargar_sku_siman(db):
         flush=True,
     )
 
+
 # ============================================================
 # DATOS ADMINISTRATIVOS
 # ============================================================
@@ -526,12 +617,15 @@ def cargar_sku_siman(db):
 @lru_cache(maxsize=4096)
 def cargar_producto(product_id):
     producto = objeto(
-        api(f"/api/catalog/pvt/product/{product_id}"),
+        api(
+            f"/api/catalog/pvt/product/{product_id}"
+        ),
         f"producto {product_id}",
     )
 
     resultado = api(
-        f"/api/catalog/pvt/product/{product_id}/salespolicy"
+        f"/api/catalog/pvt/product/"
+        f"{product_id}/salespolicy"
     )
 
     if not isinstance(resultado, list):
@@ -547,10 +641,13 @@ def cargar_producto(product_id):
             or politica.get("StoreId") is None
         ):
             raise ErrorAPI(
-                f"Política sin StoreId: producto {product_id}."
+                f"Política sin StoreId: "
+                f"producto {product_id}."
             )
 
-        politicas.add(str(politica["StoreId"]))
+        politicas.add(
+            str(politica["StoreId"])
+        )
 
     return producto, politicas
 
@@ -568,9 +665,6 @@ def cargar_contexto(sku_id):
         return contexto, ""
 
     except ErrorAPI as exc:
-        # No es necesario descartar un SKU administrativo
-        # porque su contexto indexado no esté disponible.
-        # Los errores de autorización sí deben corregirse.
         if exc.status in (401, 403):
             raise
 
@@ -579,7 +673,9 @@ def cargar_contexto(sku_id):
 
 def cargar_inventario(sku_id):
     inventario = objeto(
-        api(f"/api/logistics/pvt/inventory/skus/{sku_id}"),
+        api(
+            f"/api/logistics/pvt/inventory/skus/{sku_id}"
+        ),
         f"inventario {sku_id}",
     )
 
@@ -598,9 +694,17 @@ def cargar_inventario(sku_id):
                 f"Balance inválido: SKU {sku_id}."
             )
 
-        total = numero(balance.get("totalQuantity"))
-        reservado = numero(balance.get("reservedQuantity"))
-        ilimitado = balance.get("hasUnlimitedQuantity")
+        total = numero(
+            balance.get("totalQuantity")
+        )
+
+        reservado = numero(
+            balance.get("reservedQuantity")
+        )
+
+        ilimitado = balance.get(
+            "hasUnlimitedQuantity"
+        )
 
         disponible = None
 
@@ -640,15 +744,14 @@ def buscar_producto(pais, product_id):
                 "items": {},
                 "fuente": "",
                 "error": (
-                    f"Consultas de {pais} pausadas por errores repetidos."
+                    f"Consultas de {pais} pausadas "
+                    "por errores repetidos."
                 ),
             }
 
         preferida = circuito["ruta"]
 
-    # Mantiene siempre la misma política comercial.
-    # Si el dominio público rechaza la ruta con 400/404,
-    # prueba la API de la cuenta compartida con el mismo sc.
+    # Nunca elimina ni cambia la política comercial.
     rutas = list(dict.fromkeys([
         preferida,
         config["url"],
@@ -659,7 +762,10 @@ def buscar_producto(pais, product_id):
     fuente = ""
 
     for ruta in rutas:
-        fuente = ruta + "/api/catalog_system/pub/products/search"
+        fuente = (
+            ruta
+            + "/api/catalog_system/pub/products/search"
+        )
 
         try:
             productos = obtener_json(
@@ -685,7 +791,10 @@ def buscar_producto(pais, product_id):
                         f"Producto público inválido para {pais}."
                     )
 
-                if str(producto.get("productId")) != str(product_id):
+                if (
+                    str(producto.get("productId"))
+                    != str(product_id)
+                ):
                     raise ErrorAPI(
                         "La búsqueda devolvió un producto "
                         "distinto al solicitado."
@@ -703,8 +812,8 @@ def buscar_producto(pais, product_id):
 
             if errores:
                 print(
-                    f"{pais}: se utilizó {ruta} con "
-                    f"sc={config['sc']}. "
+                    f"{pais}: se utilizó {ruta} "
+                    f"con sc={config['sc']}. "
                     "El dominio anterior rechazó la consulta.",
                     flush=True,
                 )
@@ -717,9 +826,10 @@ def buscar_producto(pais, product_id):
             }
 
         except ErrorAPI as exc:
-            errores.append(texto_seguro(exc))
+            errores.append(
+                texto_seguro(exc)
+            )
 
-            # Solo cambia de ruta ante rechazo de solicitud/ruta.
             if exc.status not in (400, 404):
                 break
 
@@ -728,11 +838,15 @@ def buscar_producto(pais, product_id):
     with LOCK_PAIS:
         CIRCUITOS[pais]["errores"] += 1
 
-        if CIRCUITOS[pais]["errores"] >= MAX_ERRORES_PAIS:
+        if (
+            CIRCUITOS[pais]["errores"]
+            >= MAX_ERRORES_PAIS
+        ):
             CIRCUITOS[pais]["abierto"] = True
 
     print(
-        f"ERROR PUBLICO {pais}, producto {product_id}: {detalle}",
+        f"ERROR PUBLICO {pais}, "
+        f"producto {product_id}: {detalle}",
         flush=True,
     )
 
@@ -748,19 +862,32 @@ def buscar_producto(pais, product_id):
 # PROCESAMIENTO DE SKU
 # ============================================================
 
-def procesar_sku(sku_id, binding, politicas_catalogo):
+def procesar_sku(
+    sku_id,
+    binding,
+    politicas_catalogo,
+):
     sku = objeto(
-        api(f"/api/catalog/pvt/stockkeepingunit/{sku_id}"),
+        api(
+            f"/api/catalog/pvt/stockkeepingunit/{sku_id}"
+        ),
         f"SKU {sku_id}",
     )
 
     product_id = sku.get("ProductId")
 
     if product_id is None:
-        raise ErrorAPI(f"SKU {sku_id} sin ProductId.")
+        raise ErrorAPI(
+            f"SKU {sku_id} sin ProductId."
+        )
 
-    producto, politicas = cargar_producto(str(product_id))
-    contexto, error_contexto = cargar_contexto(sku_id)
+    producto, politicas = cargar_producto(
+        str(product_id)
+    )
+
+    contexto, error_contexto = cargar_contexto(
+        sku_id
+    )
 
     error_inventario = ""
 
@@ -774,16 +901,22 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
     ids_politicas = sorted(
         politicas,
         key=lambda valor: (
-            0, int(valor)
+            0,
+            int(valor),
         ) if valor.isdigit() else (
-            1, valor
+            1,
+            valor,
         ),
     )
 
     nombres = [
         politicas_catalogo.get(
-            politica_id, {}
-        ).get("Name", f"ID {politica_id}")
+            politica_id,
+            {},
+        ).get(
+            "Name",
+            f"ID {politica_id}",
+        )
         for politica_id in ids_politicas
     ]
 
@@ -814,23 +947,36 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             seller = next(
                 (
                     vendedor
-                    for vendedor in item.get("sellers") or []
-                    if str(vendedor.get("sellerId")) == SELLER_ID
+                    for vendedor in (
+                        item.get("sellers") or []
+                    )
+                    if str(
+                        vendedor.get("sellerId")
+                    ) == SELLER_ID
                 ),
                 None,
             )
 
             if seller is not None:
-                oferta = seller.get("commertialOffer") or {}
+                oferta = (
+                    seller.get("commertialOffer")
+                    or {}
+                )
 
-        cantidad = numero(oferta.get("AvailableQuantity"))
+        cantidad = numero(
+            oferta.get("AvailableQuantity")
+        )
+
         disponible = oferta.get("IsAvailable")
 
         if not resultado["ok"]:
             aparece = "ERROR_CONSULTA"
             compra = "ERROR_CONSULTA"
             estado = "ERROR_CONSULTA"
-            errores.append(f"{pais}: {resultado['error']}")
+
+            errores.append(
+                f"{pais}: {resultado['error']}"
+            )
 
         elif item is None:
             aparece = "N"
@@ -842,13 +988,17 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             compra = "N"
             estado = "SIN_OFERTA_SIMAN"
 
-        elif disponible is None or cantidad is None:
+        elif (
+            disponible is None
+            or cantidad is None
+        ):
             aparece = "Y"
             compra = "DESCONOCIDO"
             estado = "DISPONIBILIDAD_DESCONOCIDA"
 
         else:
             aparece = "Y"
+
             compra = (
                 "Y"
                 if disponible is True and cantidad > 0
@@ -867,37 +1017,65 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
         hallazgos = []
 
         if sku.get("IsActive") is False:
-            hallazgos.append("SKU_INACTIVO")
+            hallazgos.append(
+                "SKU_INACTIVO"
+            )
 
         if producto.get("IsActive") is False:
-            hallazgos.append("PRODUCTO_INACTIVO")
+            hallazgos.append(
+                "PRODUCTO_INACTIVO"
+            )
 
         if producto.get("IsVisible") is False:
-            hallazgos.append("PRODUCTO_NO_VISIBLE_CONFIG")
+            hallazgos.append(
+                "PRODUCTO_NO_VISIBLE_CONFIG"
+            )
 
         if sc not in politicas:
-            hallazgos.append("SIN_POLITICA_DEL_PAIS")
+            hallazgos.append(
+                "SIN_POLITICA_DEL_PAIS"
+            )
 
         if politica.get("IsActive") is False:
-            hallazgos.append("POLITICA_INACTIVA")
+            hallazgos.append(
+                "POLITICA_INACTIVA"
+            )
 
         if error_inventario:
-            hallazgos.append("ERROR_CONSULTA_INVENTARIO")
+            hallazgos.append(
+                "ERROR_CONSULTA_INVENTARIO"
+            )
 
         hallazgos.append(estado)
 
-        if cantidad is not None and cantidad <= 0:
-            hallazgos.append("SIN_STOCK_EN_OFERTA")
+        if (
+            cantidad is not None
+            and cantidad <= 0
+        ):
+            hallazgos.append(
+                "SIN_STOCK_EN_OFERTA"
+            )
 
-        precio = numero(oferta.get("Price"))
+        precio = numero(
+            oferta.get("Price")
+        )
 
-        if precio is not None and precio <= 0:
-            hallazgos.append("PRECIO_CERO_EN_OFERTA")
+        if (
+            precio is not None
+            and precio <= 0
+        ):
+            hallazgos.append(
+                "PRECIO_CERO_EN_OFERTA"
+            )
 
         ruta = contexto.get("DetailUrl")
 
         if not ruta and producto.get("LinkId"):
-            ruta = "/" + producto["LinkId"].strip("/") + "/p"
+            ruta = (
+                "/"
+                + producto["LinkId"].strip("/")
+                + "/p"
+            )
 
         link = None
 
@@ -905,7 +1083,11 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             link = (
                 ruta
                 if ruta.startswith("http")
-                else config["url"] + "/" + ruta.lstrip("/")
+                else (
+                    config["url"]
+                    + "/"
+                    + ruta.lstrip("/")
+                )
             )
 
         filas.append({
@@ -917,8 +1099,8 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             "sku_id": sku_id,
             "variante": sku.get("Name"),
 
-            # Conserva la interpretación histórica:
-            # disponible en la oferta del país.
+            # Compatibilidad con el archivo original.
+            # visible conserva la lógica de disponibilidad.
             "visible": compra,
             "estado": estado,
             "stock_sku": cantidad,
@@ -939,7 +1121,9 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             "seller_vinculo_activo": bandera(
                 binding.get("IsActive")
             ),
-            "sku_activo": bandera(sku.get("IsActive")),
+            "sku_activo": bandera(
+                sku.get("IsActive")
+            ),
             "producto_activo": bandera(
                 producto.get("IsActive")
             ),
@@ -957,19 +1141,26 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
             "rutas_categorias": "|".join(
                 contexto.get("CategoriesFullPath") or []
             ),
+
             "aparece_busqueda": aparece,
             "disponible_compra": compra,
 
             "politica_consultada_id": sc,
-            "politica_consultada_nombre": politica.get("Name"),
+            "politica_consultada_nombre": politica.get(
+                "Name"
+            ),
             "politica_consultada_activa": bandera(
                 politica.get("IsActive")
             ),
             "asociado_politica_pais": (
                 "Y" if sc in politicas else "N"
             ),
-            "politicas_ids": "|".join(ids_politicas),
-            "politicas_nombres": "|".join(nombres),
+            "politicas_ids": "|".join(
+                ids_politicas
+            ),
+            "politicas_nombres": "|".join(
+                nombres
+            ),
 
             **{
                 f"politica_{codigo.lower()}": (
@@ -1005,7 +1196,9 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
     return {
         "ok": not errores,
         "filas": filas,
-        "error": texto_seguro(" | ".join(errores)),
+        "error": texto_seguro(
+            " | ".join(errores)
+        ),
     }
 
 
@@ -1016,7 +1209,13 @@ def procesar_sku(sku_id, binding, politicas_catalogo):
 def exportar(db, completo):
     temporal = ARCHIVO + ".tmp"
     cantidad = 0
-    inicio = leer_meta(db, "inicio", "")
+
+    inicio = leer_meta(
+        db,
+        "inicio",
+        "",
+    )
+
     fin = ahora()
 
     with open(
@@ -1035,13 +1234,15 @@ def exportar(db, completo):
         escritor.writeheader()
 
         cursor = db.execute(
-            "SELECT filas FROM sku WHERE filas IS NOT NULL"
+            "SELECT filas FROM sku "
+            "WHERE filas IS NOT NULL"
         )
 
         for (datos,) in cursor:
             for fila in json.loads(datos):
                 fila["fecha_inicio_ciclo_utc"] = inicio
                 fila["fecha_fin_exportacion_utc"] = fin
+
                 fila["extraccion_completa"] = (
                     "Y" if completo else "N"
                 )
@@ -1049,7 +1250,11 @@ def exportar(db, completo):
                 escritor.writerow(fila)
                 cantidad += 1
 
-    os.replace(temporal, ARCHIVO)
+    os.replace(
+        temporal,
+        ARCHIVO,
+    )
+
     return cantidad
 
 
@@ -1057,8 +1262,14 @@ def salida_github(nombre, valor):
     ruta = os.getenv("GITHUB_OUTPUT")
 
     if ruta:
-        with open(ruta, "a", encoding="utf-8") as archivo:
-            archivo.write(f"{nombre}={valor}\n")
+        with open(
+            ruta,
+            "a",
+            encoding="utf-8",
+        ) as archivo:
+            archivo.write(
+                f"{nombre}={valor}\n"
+            )
 
 
 # ============================================================
@@ -1066,9 +1277,13 @@ def salida_github(nombre, valor):
 # ============================================================
 
 def main():
-    salida_github("publicar", "false")
+    salida_github(
+        "publicar",
+        "false",
+    )
 
     db = abrir_estado()
+
     fallo = False
     pausa = False
     intentados = 0
@@ -1088,12 +1303,17 @@ def main():
         )
 
         if not isinstance(politicas, list):
-            raise ErrorAPI("Listado de políticas inválido.")
+            raise ErrorAPI(
+                "Listado de políticas inválido."
+            )
 
         politicas_catalogo = {
-            str(p["Id"]): p
-            for p in politicas
-            if isinstance(p, dict) and p.get("Id") is not None
+            str(politica["Id"]): politica
+            for politica in politicas
+            if (
+                isinstance(politica, dict)
+                and politica.get("Id") is not None
+            )
         }
 
         for pais, config in PAISES.items():
@@ -1101,7 +1321,8 @@ def main():
 
             if sc not in politicas_catalogo:
                 raise ErrorAPI(
-                    f"No existe la política {sc} para {pais}."
+                    f"No existe la política {sc} "
+                    f"para {pais}."
                 )
 
             print(
@@ -1113,17 +1334,24 @@ def main():
         cargar_sku_siman(db)
 
         print(
-            f"Modo={'PRUEBA' if SOLO_PRUEBA else 'EXTRACCION'}; "
-            f"hilos={WORKERS}; máximo={RPS} solicitudes/s.",
+            f"Modo="
+            f"{'PRUEBA' if SOLO_PRUEBA else 'EXTRACCION'}; "
+            f"hilos={WORKERS}; "
+            f"máximo={RPS} solicitudes/s.",
             flush=True,
         )
 
-        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=WORKERS
+        ) as executor:
             while True:
                 revisar_tiempo()
 
                 limite = (
-                    min(WORKERS, 3 - intentados)
+                    min(
+                        WORKERS,
+                        3 - intentados,
+                    )
                     if SOLO_PRUEBA
                     else WORKERS
                 )
@@ -1140,7 +1368,10 @@ def main():
                     ORDER BY estado DESC, id
                     LIMIT ?
                     """,
-                    (RUN_ID, limite),
+                    (
+                        RUN_ID,
+                        limite,
+                    ),
                 ).fetchall()
 
                 if not lote:
@@ -1187,8 +1418,10 @@ def main():
 
                         if correcto:
                             errores_seguidos = 0
+
                         else:
                             errores_seguidos += 1
+
                             print(
                                 f"SKU {sku_id}: "
                                 f"{resultado['error']}",
@@ -1210,7 +1443,6 @@ def main():
 
                     except Exception as exc:
                         errores_seguidos += 1
-
                         detalle = texto_seguro(exc)
 
                         with db:
@@ -1222,7 +1454,11 @@ def main():
                                     ultima_ejecucion = ?
                                 WHERE id = ?
                                 """,
-                                (detalle, RUN_ID, sku_id),
+                                (
+                                    detalle,
+                                    RUN_ID,
+                                    sku_id,
+                                ),
                             )
 
                         print(
@@ -1242,7 +1478,8 @@ def main():
 
                 print(
                     f"Avance: {listos}/{total} SKU completos; "
-                    f"intentados en esta ejecución: {intentados}",
+                    f"intentados en esta ejecución: "
+                    f"{intentados}",
                     flush=True,
                 )
 
@@ -1254,11 +1491,13 @@ def main():
 
                 if abierto or errores_seguidos >= 3:
                     fallo = True
+
                     print(
                         "Se detiene el lote por errores repetidos. "
                         "El avance queda guardado.",
                         flush=True,
                     )
+
                     break
 
                 if pausa:
@@ -1282,6 +1521,7 @@ def main():
 
     except PausaExtraccion:
         pausa = True
+
         print(
             "Tiempo de trabajo alcanzado. "
             "Se continuará desde el avance guardado.",
@@ -1290,6 +1530,7 @@ def main():
 
     except Exception as exc:
         fallo = True
+
         print(
             f"ERROR GENERAL: {texto_seguro(exc)}",
             flush=True,
@@ -1297,7 +1538,10 @@ def main():
 
     finally:
         try:
-            filas = exportar(db, completo)
+            filas = exportar(
+                db,
+                completo,
+            )
 
             total, listos = db.execute(
                 """
@@ -1329,16 +1573,24 @@ def main():
 
             if completo:
                 with db:
-                    escribir_meta(db, "completo", "1")
+                    escribir_meta(
+                        db,
+                        "completo",
+                        "1",
+                    )
 
-                salida_github("publicar", "true")
+                salida_github(
+                    "publicar",
+                    "true",
+                )
 
         finally:
             db.close()
 
     if fallo:
         raise SystemExit(
-            "Revisa los errores. No se reemplazará el CSV publicado."
+            "Revisa los errores. "
+            "No se reemplazará el CSV publicado."
         )
 
     if SOLO_PRUEBA:
