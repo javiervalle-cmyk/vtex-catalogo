@@ -243,7 +243,13 @@ def obtener_json(url, privada=False, params=None):
 
             status = respuesta.status_code
 
-        if status==200 or (not privada and status == 206):
+            # La búsqueda pública puede devolver HTTP 206.
+            aceptada = (
+                status == 200
+                or (not privada and status == 206)
+            )
+
+            if aceptada:
                 try:
                     return respuesta.json()
 
@@ -265,10 +271,7 @@ def obtener_json(url, privada=False, params=None):
                     status not in (408, 429)
                     and status < 500
                 ):
-                    raise ErrorAPI(
-                        detalle,
-                        status,
-                    )
+                    raise ErrorAPI(detalle, status)
 
         except requests.RequestException as exc:
             detalle = (
@@ -277,10 +280,7 @@ def obtener_json(url, privada=False, params=None):
             )
 
         if intento == MAX_REINTENTOS - 1:
-            raise ErrorAPI(
-                detalle,
-                status,
-            )
+            raise ErrorAPI(detalle, status)
 
         espera = tiempo_reintento(
             respuesta,
