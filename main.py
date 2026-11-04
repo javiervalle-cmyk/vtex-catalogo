@@ -457,7 +457,7 @@ def cargar_sku_siman(db):
         flush=True,
     )
 
-      bindings = api(
+    bindings = api(
         "/api/sku-binding/pvt/skuseller/list/"
         f"bysellerId/{SELLER_ID}"
     )
@@ -479,35 +479,45 @@ def cargar_sku_siman(db):
                 "La API devolvió un seller distinto al solicitado."
             )
 
-        sku_id = str(binding.get("StockKeepingUnitId", ""))
+        sku_id = str(
+            binding.get("StockKeepingUnitId", "")
+        )
 
         if not sku_id.isdigit():
             raise ErrorAPI(
-                "Un vínculo no contiene StockKeepingUnitId válido."
+                "Un vínculo no contiene "
+                "StockKeepingUnitId válido."
             )
 
-        # No se filtra IsActive: necesitamos también los inactivos.
+        # También conserva los vínculos inactivos.
         registros[sku_id] = binding
 
     with db:
         db.executemany(
-            "INSERT OR IGNORE INTO sku (id, binding) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO sku "
+            "(id, binding) VALUES (?, ?)",
             (
                 (
                     sku_id,
-                    json.dumps(binding, ensure_ascii=False),
+                    json.dumps(
+                        binding,
+                        ensure_ascii=False,
+                    ),
                 )
                 for sku_id, binding in registros.items()
             ),
         )
 
-        escribir_meta(db, "listado_completo", "1")
+        escribir_meta(
+            db,
+            "listado_completo",
+            "1",
+        )
 
     print(
         f"SKU vinculados a Siman: {len(registros)}",
         flush=True,
     )
-
 
 # ============================================================
 # DATOS ADMINISTRATIVOS
