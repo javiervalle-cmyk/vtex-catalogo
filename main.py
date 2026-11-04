@@ -243,9 +243,7 @@ def obtener_json(url, privada=False, params=None):
 
             status = respuesta.status_code
 
-                       if status == 200 or (
-                not privada and status == 206
-            ):
+        if status==200 or (not privada and status == 206):
                 try:
                     return respuesta.json()
 
