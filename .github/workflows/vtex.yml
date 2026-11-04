@@ -1,19 +1,31 @@
 name: VTEX Catalogo
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - main.py
+      - tests/test_vtex_batch.py
+      - .github/workflows/vtex.yml
   workflow_dispatch:
     inputs:
       solo_prueba:
         description: "Probar hasta 100 referencias sin publicar"
         type: boolean
-        default: false
+        default: true
       reiniciar:
         description: "Descartar avance y comenzar un ciclo nuevo"
+        type: boolean
+        default: false
+      forzar_actualizacion:
+        description: "Iniciar otro ciclo aunque el de hoy ya este publicado"
         type: boolean
         default: false
   schedule:
     # 11:00 UTC = 5:00 a. m. de El Salvador
     - cron: "0 11 * * *"
+    # Continuaciones: solo trabajan cuando hay un ciclo pendiente.
+    - cron: "0 3,7,15,19,23 * * *"
 
 permissions:
   contents: write
@@ -31,19 +43,22 @@ jobs:
       PYTHONUNBUFFERED: "1"
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VTEX_ACCOUNT: siman
-      VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
-      VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
       VTEX_SELLER_ID: "1"
-      MAX_WORKERS: "2"
-      REQUESTS_PER_SECOND: "2"
+      MAX_WORKERS: "12"
+      REQUESTS_PER_SECOND: "8"
       MAX_MINUTES: "220"
       SKU_INPUT_FILE: data/skus_base.csv
       TEST_LIMIT: "100"
+      REF_BATCH_SIZE: "100"
+      SEARCH_BATCH_SIZE: "40"
+      METADATA_TTL_HOURS: "24"
+      EVENT_SCHEDULE: ${{ github.event.schedule }}
+      FORZAR_ACTUALIZACION: ${{ inputs.forzar_actualizacion == true && 'true' || 'false' }}
       SC_SV: "1"
       SC_GT: "4"
       SC_NI: "15"
       SC_CR: "2"
-      SOLO_PRUEBA: ${{ inputs.solo_prueba == true && 'true' || 'false' }}
+      SOLO_PRUEBA: ${{ github.event_name == 'push' || inputs.solo_prueba == true && 'true' || 'false' }}
       REINICIAR: ${{ inputs.reiniciar == true && 'true' || 'false' }}
 
     steps:
@@ -61,8 +76,14 @@ jobs:
       - name: Validar sintaxis
         run: python -m py_compile main.py
 
+      - name: Verificar procesamiento sin red
+        run: python tests/test_vtex_batch.py
+
       - name: Ejecutar catalogo
         id: extraccion
+        env:
+          VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
+          VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
         run: python main.py
 
       - name: Guardar CSV
@@ -95,7 +116,7 @@ jobs:
       # Guarda el avance después de la publicación o de una pausa/error.
       # El Python lo descarga automáticamente en la próxima ejecución.
       - name: Guardar avance interno
-        if: ${{ always() && inputs.solo_prueba != true && hashFiles('.vtex-lista-state/checkpoint.sqlite') != '' }}
+        if: ${{ always() && github.event_name != 'push' && inputs.solo_prueba != true && hashFiles('.vtex-lista-state/checkpoint.sqlite') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: vtex-estado-lista-v1
