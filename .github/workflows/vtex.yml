@@ -67,7 +67,7 @@ jobs:
 
           SC_SV: "1"
           SC_CR: "2"
-          SC_NI: "3"
+          SC_NI: "15"
           SC_GT: "4"
 
           SOLO_PRUEBA: ${{ inputs.solo_prueba == true && 'true' || 'false' }}
