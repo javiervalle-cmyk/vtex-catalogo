@@ -1316,6 +1316,20 @@ def main():
             )
         }
 
+                print(
+            "\nPOLITICAS COMERCIALES DE LA CUENTA",
+            flush=True,
+        )
+
+        for politica_id, politica in politicas_catalogo.items():
+            print(
+                f"ID={politica_id}; "
+                f"Nombre={politica.get('Name')}; "
+                f"Activa={politica.get('IsActive')}; "
+                f"Pais={politica.get('CountryCode')}",
+                flush=True,
+            )
+
         for pais, config in PAISES.items():
             sc = config["sc"]
 
