@@ -404,7 +404,7 @@ def cargar_politicas():
 def cargar_muestra():
     from urllib.parse import quote
 
-    muestras_conocidas = [
+       muestras_conocidas = [
         {
             "referencia": "105062291",
             "pais_esperado": "SV",
@@ -412,6 +412,10 @@ def cargar_muestra():
         {
             "referencia": "104631517",
             "pais_esperado": "NI",
+        },
+        {
+            "referencia": "105360348",
+            "pais_esperado": "SV",
         },
     ]
 
