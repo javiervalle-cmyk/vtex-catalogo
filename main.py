@@ -72,7 +72,6 @@ class CoverageError(RuntimeError):
 # ============================================================
 
 def total_header(headers):
-
     normalized = {
         str(key).lower(): value
         for key, value in headers.items()
@@ -84,7 +83,10 @@ def total_header(headers):
         or ""
     )
 
-    match = re.search(r"/\s*(\d+)\s*$", str(raw))
+    match = re.search(
+        r"/\s*(\d+)\s*$",
+        str(raw),
+    )
 
     if not match:
         raise CoverageError(
@@ -96,12 +98,13 @@ def total_header(headers):
 
 
 def retry_after(value):
-
     try:
-        return max(0.0, float(value))
+        return max(
+            0.0,
+            float(value),
+        )
 
     except (ValueError, TypeError):
-
         try:
             retry_date = parsedate_to_datetime(value)
 
@@ -119,7 +122,6 @@ def retry_after(value):
 
 
 def available(offer):
-
     try:
         quantity = float(
             offer.get("AvailableQuantity") or 0
@@ -135,7 +137,6 @@ def available(offer):
 
 
 def categories(nodes, path=()):
-
     if not isinstance(nodes, list):
         raise CoverageError(
             "Arbol de categorias invalido."
@@ -144,7 +145,6 @@ def categories(nodes, path=()):
     result = {}
 
     for node in nodes:
-
         node_id = str(node["id"])
 
         key = path + (node_id,)
@@ -177,7 +177,6 @@ class Client:
         rps=8.0,
         deadline_minutes=220,
     ):
-
         self.rps = rps
 
         self.deadline = (
@@ -197,7 +196,6 @@ class Client:
         self.retries = 0
 
     def pause(self, seconds):
-
         if (
             time.monotonic() + seconds
             >= self.deadline
@@ -209,11 +207,8 @@ class Client:
         time.sleep(seconds)
 
     def throttle(self):
-
         while True:
-
             with self.lock:
-
                 now = time.monotonic()
 
                 delay = max(
@@ -222,11 +217,9 @@ class Client:
                 ) - now
 
                 if delay <= 0:
-
                     if now >= self.deadline:
                         raise TimeoutError(
-                            "Se alcanzo el limite global "
-                            "de tiempo."
+                            "Se alcanzo el limite global de tiempo."
                         )
 
                     self.next_request = (
@@ -240,7 +233,6 @@ class Client:
             self.pause(delay)
 
     def get(self, url, params=None):
-
         session = getattr(
             self.local,
             "session",
@@ -248,12 +240,11 @@ class Client:
         )
 
         if session is None:
-
             session = requests.Session()
 
             session.headers.update({
                 "Accept": "application/json",
-                "User-Agent": "SimanCatalogExport/4.0",
+                "User-Agent": "SimanCatalogExport/5.0",
             })
 
             self.local.session = session
@@ -262,11 +253,9 @@ class Client:
                 self.sessions.append(session)
 
         for attempt in range(5):
-
             self.throttle()
 
             try:
-
                 response = session.get(
                     url,
                     params=params,
@@ -277,7 +266,6 @@ class Client:
                     response.status_code == 429
                     or response.status_code >= 500
                 ):
-
                     delay = max(
                         retry_after(
                             response.headers.get(
@@ -289,11 +277,9 @@ class Client:
                     )
 
                     with self.lock:
-
                         self.retries += 1
 
                         if response.status_code == 429:
-
                             self.rps = max(
                                 0.5,
                                 self.rps * 0.80,
@@ -313,17 +299,15 @@ class Client:
                         )
 
                     self.pause(delay)
-
                     continue
 
                 try:
-
                     response.raise_for_status()
 
-                    data = response.json()
-                    headers = response.headers
-
-                    return data, headers
+                    return (
+                        response.json(),
+                        response.headers,
+                    )
 
                 finally:
                     response.close()
@@ -333,7 +317,6 @@ class Client:
                 requests.ConnectionError,
                 requests.exceptions.JSONDecodeError,
             ):
-
                 if attempt == 4:
                     raise
 
@@ -352,7 +335,6 @@ class Client:
         )
 
     def close(self):
-
         for session in self.sessions:
             session.close()
 
@@ -366,13 +348,11 @@ def rows_for_product(
     product,
     timestamp,
 ):
-
     rows = []
 
     items = product.get("items")
 
     if not isinstance(items, list) or not items:
-
         raise CoverageError(
             f"Producto {product.get('productId')} "
             "sin SKUs validos."
@@ -381,7 +361,6 @@ def rows_for_product(
     seen = set()
 
     for item in items:
-
         sku = str(
             item.get("itemId") or ""
         )
@@ -472,7 +451,6 @@ def rows_for_product(
         es_propio = None
 
         if seller:
-
             es_propio = (
                 "Siman"
                 if str(
@@ -481,15 +459,14 @@ def rows_for_product(
                 else "Marketplace"
             )
 
-        estado = (
-            "DISPONIBLE"
-            if buy
-            else (
-                "SIN_OFERTA"
-                if not sellers
-                else "OFERTA_NO_DISPONIBLE"
-            )
-        )
+        if buy:
+            estado = "DISPONIBLE"
+
+        elif not sellers:
+            estado = "SIN_OFERTA"
+
+        else:
+            estado = "OFERTA_NO_DISPONIBLE"
 
         row = {
             "pais": pais,
@@ -503,7 +480,9 @@ def rows_for_product(
             "ref_sku": ref_sku,
             "sku_id": sku,
             "variante": item.get("name"),
-            "visible": "Y" if buy else "N",
+            "visible": (
+                "Y" if buy else "N"
+            ),
             "estado": estado,
             "stock_sku": offer.get(
                 "AvailableQuantity"
@@ -553,7 +532,7 @@ def rows_for_product(
 
 
 # ============================================================
-# SOLICITUD PAGINA
+# CONSULTA DE PAGINAS
 # ============================================================
 
 def request_page(
@@ -562,7 +541,6 @@ def request_page(
     path,
     start,
 ):
-
     params = {
         "_from": start,
         "_to": start + PAGE_SIZE - 1,
@@ -570,7 +548,6 @@ def request_page(
     }
 
     if path:
-
         params["fq"] = (
             "C:/"
             + "/".join(path)
@@ -601,16 +578,13 @@ def validate_page_data(
     start,
     data,
 ):
-
     if not isinstance(data, list):
-
         raise CoverageError(
             "Respuesta invalida: "
             f"{pais} {path} desde={start}"
         )
 
     if len(data) > PAGE_SIZE:
-
         raise CoverageError(
             "Pagina excede PAGE_SIZE: "
             f"{pais} {path} desde={start}; "
@@ -626,14 +600,12 @@ def validate_page_data(
     ]
 
     if any(not product_id for product_id in ids):
-
         raise CoverageError(
             "Pagina contiene productId vacio: "
             f"{pais} {path} desde={start}"
         )
 
     if len(set(ids)) != len(ids):
-
         raise CoverageError(
             "Pagina contiene productId repetido: "
             f"{pais} {path} desde={start}"
@@ -646,7 +618,6 @@ def fetch_page(
     path,
     start,
 ):
-
     best_data = None
     best_total = None
     best_received = -1
@@ -656,7 +627,6 @@ def fetch_page(
     for attempt in range(
         SHORT_PAGE_RETRIES + 1
     ):
-
         data, headers = request_page(
             client,
             pais,
@@ -684,17 +654,14 @@ def fetch_page(
         )
 
         if len(data) > best_received:
-
             best_data = data
             best_total = total
             best_received = len(data)
 
         if len(data) == expected_count:
-
             return data, total
 
         if attempt < SHORT_PAGE_RETRIES:
-
             delay = (
                 SHORT_PAGE_BASE_DELAY
                 * (attempt + 1)
@@ -717,7 +684,6 @@ def fetch_page(
             client.pause(delay)
 
     if len(set(totals_seen)) > 1:
-
         print(
             "ADVERTENCIA TOTAL VARIABLE EN REINTENTO: "
             f"pais={pais}; "
@@ -751,7 +717,7 @@ def fetch_page(
 
 
 # ============================================================
-# EXTRACCION
+# EXTRACCION GENERAL
 # ============================================================
 
 def collect(
@@ -759,7 +725,6 @@ def collect(
     workers=8,
     countries=None,
 ):
-
     countries = list(
         countries or PAISES.keys()
     )
@@ -775,8 +740,11 @@ def collect(
         flush=True,
     )
 
-    for pais in countries:
+    # --------------------------------------------------------
+    # ARBOLES DE CATEGORIAS
+    # --------------------------------------------------------
 
+    for pais in countries:
         url = (
             PAISES[pais]
             + "/api/catalog_system/pub/category/tree/5"
@@ -791,13 +759,19 @@ def collect(
             for node in tree
         ]
 
+    # --------------------------------------------------------
+    # COLAS Y CONTROLES
+    # --------------------------------------------------------
+
     tasks = deque()
 
     scheduled = {}
 
     for pais in countries:
-
-        key = (pais, ())
+        key = (
+            pais,
+            (),
+        )
 
         scheduled[key] = {0}
 
@@ -828,12 +802,15 @@ def collect(
     started = time.monotonic()
     last_report = 0.0
 
+    # --------------------------------------------------------
+    # PROGRAMACION DE PAGINAS
+    # --------------------------------------------------------
+
     def schedule_offset(
         pais,
         path,
         offset,
     ):
-
         key = (
             pais,
             path,
@@ -847,7 +824,9 @@ def collect(
         if offset in scheduled[key]:
             return
 
-        scheduled[key].add(offset)
+        scheduled[key].add(
+            offset
+        )
 
         tasks.append(
             (
@@ -862,7 +841,6 @@ def collect(
         path,
         total,
     ):
-
         limit = min(
             total,
             MAX_ITEMS,
@@ -873,7 +851,6 @@ def collect(
             limit,
             PAGE_SIZE,
         ):
-
             schedule_offset(
                 pais,
                 path,
@@ -884,6 +861,13 @@ def collect(
         pais,
         path,
     ):
+        key = (
+            pais,
+            path,
+        )
+
+        if key in split:
+            return
 
         children = trees[pais].get(
             path,
@@ -891,27 +875,24 @@ def collect(
         )
 
         if not children:
-
             raise CoverageError(
                 f"{pais} categoria {path}: "
                 "supera el limite de 2500 productos "
                 "y no existen subcategorias para dividirla."
             )
 
-        split[
-            (
-                pais,
-                path,
-            )
-        ] = children
+        split[key] = children
 
         for child in children:
-
             schedule_offset(
                 pais,
                 child,
                 0,
             )
+
+    # --------------------------------------------------------
+    # PROCESAMIENTO PARALELO
+    # --------------------------------------------------------
 
     with ThreadPoolExecutor(
         max_workers=workers
@@ -925,7 +906,6 @@ def collect(
                 tasks
                 and len(pending) < workers * 2
             ):
-
                 task = tasks.popleft()
 
                 future = executor.submit(
@@ -946,7 +926,6 @@ def collect(
             )
 
             for future in ready:
-
                 pais, path, start = (
                     pending.pop(future)
                 )
@@ -959,18 +938,16 @@ def collect(
                 )
 
                 # --------------------------------------------
-                # Control de total variable
+                # CONTROL DE TOTAL VARIABLE
                 # --------------------------------------------
 
                 if key not in first_total:
-
                     first_total[key] = total
                     latest_total[key] = total
                     minimum_total[key] = total
                     maximum_total[key] = total
 
                 else:
-
                     previous_total = latest_total[key]
 
                     latest_total[key] = total
@@ -986,7 +963,6 @@ def collect(
                     )
 
                     if previous_total != total:
-
                         print(
                             "ADVERTENCIA TOTAL VARIABLE: "
                             f"pais={pais}; "
@@ -1005,20 +981,18 @@ def collect(
                 )
 
                 # --------------------------------------------
-                # Primera pagina
+                # PRIMERA PAGINA
                 # --------------------------------------------
 
                 if start == 0:
 
                     if total > MAX_ITEMS:
-
                         schedule_children(
                             pais,
                             path,
                         )
 
                     else:
-
                         schedule_pages(
                             pais,
                             path,
@@ -1026,7 +1000,7 @@ def collect(
                         )
 
                 # --------------------------------------------
-                # El total puede crecer mientras paginamos
+                # TOTAL CRECIO DURANTE PAGINACION
                 # --------------------------------------------
 
                 elif key not in split:
@@ -1037,7 +1011,6 @@ def collect(
                     )
 
                     if maximum <= MAX_ITEMS:
-
                         schedule_pages(
                             pais,
                             path,
@@ -1045,16 +1018,20 @@ def collect(
                         )
 
                     else:
-
+                        # Esta situacion es poco frecuente:
+                        # empezamos paginando una categoria
+                        # bajo 2500 y luego crecio por encima
+                        # del limite.
                         raise CoverageError(
                             f"{pais} categoria {path}: "
-                            "el total crecio por encima "
-                            f"de {MAX_ITEMS} durante la lectura. "
-                            "Requiere reparticionar."
+                            f"el total crecio a {maximum}, "
+                            f"superando {MAX_ITEMS}. "
+                            "Se requiere una nueva extraccion "
+                            "particionada."
                         )
 
                 # --------------------------------------------
-                # Procesar productos
+                # PRODUCTOS DE LA PAGINA
                 # --------------------------------------------
 
                 for product in data:
@@ -1065,15 +1042,16 @@ def collect(
                     )
 
                     if not product_id:
-
                         raise CoverageError(
-                            f"Producto sin ID: "
-                            f"{pais} {path} "
+                            "Producto sin ID: "
+                            f"pais={pais}; "
+                            f"categoria={path}; "
                             f"desde={start}"
                         )
 
+                    # La API puede mover un producto entre
+                    # paginas mientras el catalogo cambia.
                     if product_id in membersrepeated_products += 1
-
                         continue
 
                     members[key].add(
@@ -1085,7 +1063,8 @@ def collect(
                         product_id,
                     )
 
-                    # Producto incluido en varias categorias.
+                    # El mismo producto puede pertenecer
+                    # a distintas categorias.
                     if product_key in processed_products:
                         continue
 
@@ -1115,7 +1094,6 @@ def collect(
                             and existing["productId"]
                             != product_id
                         ):
-
                             raise CoverageError(
                                 "Un mismo SKU pertenece a "
                                 "productos diferentes: "
@@ -1127,13 +1105,16 @@ def collect(
 
                 done_pages += 1
 
+            # --------------------------------------------
+            # LOG DE AVANCE
+            # --------------------------------------------
+
             now = time.monotonic()
 
             if (
                 now - last_report
                 >= 15
             ):
-
                 print(
                     "AVANCE: "
                     f"paginas={done_pages}; "
@@ -1161,7 +1142,6 @@ def collect(
         pais,
         path,
     ):
-
         key = (
             pais,
             path,
@@ -1170,9 +1150,9 @@ def collect(
         if key in validation_cache:
             return validation_cache[key]
 
-        # --------------------------------------------
-        # Particion dividida por categorias
-        # --------------------------------------------
+        # ----------------------------------------------------
+        # PARTICION DIVIDIDA
+        # ----------------------------------------------------
 
         if key in split:
 
@@ -1191,9 +1171,9 @@ def collect(
 
             return ids
 
-        # --------------------------------------------
-        # Particion paginada normalmente
-        # --------------------------------------------
+        # ----------------------------------------------------
+        # PARTICION PAGINADA
+        # ----------------------------------------------------
 
         ids = set(
             members.get(
@@ -1201,6 +1181,12 @@ def collect(
                 set(),
             )
         )
+
+        if key not in first_total:
+            raise CoverageError(
+                "Particion sin informacion de total: "
+                f"pais={pais}; categoria={path}"
+            )
 
         control_page, fresh_total = fetch_page(
             client,
@@ -1215,6 +1201,7 @@ def collect(
                 or ""
             )
             for product in control_page
+            if product.get("productId")
         }
 
         missing_control = (
@@ -1222,33 +1209,32 @@ def collect(
         )
 
         if missing_control:
-
             raise CoverageError(
                 "Validacion final fallo: "
                 f"pais={pais}; "
                 f"categoria={path}; "
-                "la pagina actual contiene "
-                f"{len(missing_control)} productos "
-                "que no fueron recuperados."
+                f"faltantes_en_control="
+                f"{len(missing_control)}"
             )
 
         recovered = len(ids)
 
         if recovered < fresh_total:
-
             raise CoverageError(
                 "Cobertura incompleta: "
                 f"pais={pais}; "
                 f"categoria={path}; "
                 f"recuperados={recovered}; "
                 f"total_actual={fresh_total}; "
-                f"total_inicial={first_total.get(key)}; "
-                f"total_minimo={minimum_total.get(key)}; "
-                f"total_maximo={maximum_total.get(key)}"
+                f"total_inicial="
+                f"{first_total.get(key)}; "
+                f"total_minimo="
+                f"{minimum_total.get(key)}; "
+                f"total_maximo="
+                f"{maximum_total.get(key)}"
             )
 
         if recovered > fresh_total:
-
             print(
                 "CATALOGO CAMBIO DURANTE LA LECTURA: "
                 f"pais={pais}; "
@@ -1264,7 +1250,7 @@ def collect(
         return ids
 
     # ========================================================
-    # VALIDACION GENERAL POR PAIS
+    # RESUMEN Y VALIDACION POR PAIS
     # ========================================================
 
     summary = {}
@@ -1281,7 +1267,7 @@ def collect(
             (),
         )
 
-        # Validacion adicional de la raiz.
+        # Consulta de control final del pais.
         control_page, current_root_total = fetch_page(
             client,
             pais,
@@ -1295,6 +1281,7 @@ def collect(
                 or ""
             )
             for product in control_page
+            if product.get("productId")
         }
 
         missing_root = (
@@ -1302,7 +1289,6 @@ def collect(
         )
 
         if missing_root:
-
             raise CoverageError(
                 "Validacion raiz fallo: "
                 f"pais={pais}; "
@@ -1310,7 +1296,6 @@ def collect(
             )
 
         if len(root_ids) < current_root_total:
-
             raise CoverageError(
                 "Cobertura raiz incompleta: "
                 f"pais={pais}; "
@@ -1319,12 +1304,12 @@ def collect(
             )
 
         if len(root_ids) > current_root_total:
-
             print(
                 "COBERTURA POR CATEGORIAS: "
                 f"pais={pais}; "
-                f"productos_recuperados={len(root_ids)}; "
-                "total_busqueda_general="
+                f"productos_recuperados="
+                f"{len(root_ids)}; "
+                f"total_busqueda_general="
                 f"{current_root_total}. "
                 "Se conservan los productos encontrados.",
                 flush=True,
@@ -1337,13 +1322,11 @@ def collect(
         )
 
         if not root_ids:
-
             raise CoverageError(
                 f"{pais}: no se recuperaron productos."
             )
 
         if not sku_count:
-
             raise CoverageError(
                 f"{pais}: no se recuperaron SKU."
             )
@@ -1374,7 +1357,6 @@ def write_csv(
     rows,
     path,
 ):
-
     path = Path(path)
 
     temporary_path = path.with_suffix(
@@ -1412,21 +1394,19 @@ def write_csv(
         )
 
     finally:
-
         temporary_path.unlink(
             missing_ok=True
         )
 
 
 # ============================================================
-# OUTPUT GITHUB
+# OUTPUT GITHUB ACTIONS
 # ============================================================
 
 def output(
     name,
     value,
 ):
-
     github_output = os.getenv(
         "GITHUB_OUTPUT"
     )
@@ -1451,7 +1431,7 @@ def output(
 
 def main():
 
-    # Nunca permitir publicar hasta finalizar correctamente.
+    # Bloquear publicacion hasta completar todo.
     output(
         "publicar",
         "false",
@@ -1553,7 +1533,7 @@ def main():
             flush=True,
         )
 
-        # Solo llegar aqui habilita la publicacion.
+        # Solamente despues de toda la validacion.
         output(
             "publicar",
             "true",
@@ -1580,7 +1560,6 @@ def main():
         raise
 
     finally:
-
         client.close()
 
 
