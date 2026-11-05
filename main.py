@@ -229,7 +229,9 @@ def collect(client, workers=8, test=False, countries=None):
                 pais, path, start = pending.pop(future)
                 data, total = future.result()
                 key = (pais, path)
-                if key in expected and expected[key] != total:
+                comparable = min(total, 100) if test else total
+                previous = min(expected.get(key, total), 100) if test else expected.get(key, total)
+                if key in expected and previous != comparable:
                     raise CoverageError(f'El total cambio durante la lectura: {pais} {path}. Reintentar.')
                 expected[key] = total
                 if start == 0:

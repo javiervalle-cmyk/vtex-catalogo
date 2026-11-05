@@ -136,6 +136,11 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(rows),5)
         self.assertEqual(summary['NI']['total_api'],4)
 
+    def test_preview_ignores_growth_beyond_sample(self):
+        c=FakeClient({():[product(i) for i in range(150)]},changed=True)
+        rows,_=m.collect(c,2,test=True,countries=['GT'])
+        self.assertEqual(len(rows),100)
+
     def test_retry_after(self):
         self.assertEqual(m.retry_after('60'),60)
         self.assertEqual(m.retry_after('bad'),0)
