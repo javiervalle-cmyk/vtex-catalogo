@@ -1,5 +1,4 @@
 name: VTEX Catalogo
-
 on:
   push:
     branches: [main]
@@ -10,94 +9,52 @@ on:
   workflow_dispatch:
     inputs:
       solo_prueba:
-        description: "Probar hasta 100 referencias sin publicar"
+        description: "Consultar hasta 100 productos por pais, sin publicar"
         type: boolean
         default: true
-      reiniciar:
-        description: "Descartar avance y comenzar un ciclo nuevo"
-        type: boolean
-        default: false
-      forzar_actualizacion:
-        description: "Iniciar otro ciclo aunque el de hoy ya este publicado"
-        type: boolean
-        default: false
   schedule:
-    # 11:00 UTC = 5:00 a. m. de El Salvador
+    # 5:00 a. m. de El Salvador.
     - cron: "0 11 * * *"
-    # Continuaciones: solo trabajan cuando hay un ciclo pendiente.
-    - cron: "0 3,7,15,19,23 * * *"
-
 permissions:
   contents: write
-  actions: read
-
 concurrency:
   group: vtex-catalogo
   cancel-in-progress: false
-
 jobs:
   catalogo:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 250
     env:
       PYTHONUNBUFFERED: "1"
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      VTEX_ACCOUNT: siman
-      VTEX_SELLER_ID: "1"
-      MAX_WORKERS: "12"
+      MAX_WORKERS: "8"
       REQUESTS_PER_SECOND: "8"
       MAX_MINUTES: "220"
-      SKU_INPUT_FILE: data/skus_base.csv
-      TEST_LIMIT: "100"
-      REF_BATCH_SIZE: "100"
-      SEARCH_BATCH_SIZE: "40"
-      METADATA_TTL_HOURS: "24"
-      EVENT_SCHEDULE: ${{ github.event.schedule }}
-      FORZAR_ACTUALIZACION: ${{ inputs.forzar_actualizacion == true && 'true' || 'false' }}
-      SC_SV: "1"
-      SC_GT: "4"
-      SC_NI: "15"
-      SC_CR: "2"
-      SOLO_PRUEBA: ${{ github.event_name == 'push' || inputs.solo_prueba == true && 'true' || 'false' }}
-      REINICIAR: ${{ inputs.reiniciar == true && 'true' || 'false' }}
-
+      SOLO_PRUEBA: ${{ (github.event_name == 'push' || inputs.solo_prueba == true) && 'true' || 'false' }}
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
-
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Instalar dependencias
         run: python -m pip install "requests>=2.32,<3"
-
       - name: Validar sintaxis
         run: python -m py_compile main.py
-
-      - name: Verificar procesamiento sin red
-        run: python tests/test_vtex_batch.py
-
-      - name: Ejecutar catalogo
+      - name: Verificar cobertura y procesamiento sin red
+        run: python -m unittest discover -s tests -p test_vtex_batch.py -v
+      - name: Ejecutar catalogo publico
         id: extraccion
-        env:
-          VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
-          VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
         run: python main.py
-
       - name: Guardar CSV
-        if: ${{ always() && hashFiles('catalogo_CAM.csv') != '' }}
+        if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
           name: catalogo_CAM
-          path: catalogo_CAM.csv
+          path: catalogo_CAM*.csv
           if-no-files-found: error
           retention-days: 7
           compression-level: 6
-
-      # Se publica el mismo nombre y tag que consume Power BI.
-      # Una vista previa nunca pasa esta condición.
       - name: Reemplazar CSV del Release latest
         if: ${{ success() && steps.extraccion.outputs.publicar == 'true' }}
         uses: softprops/action-gh-release@v2
@@ -108,20 +65,3 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Confirmar publicacion
-        if: ${{ success() && steps.extraccion.outputs.publicar == 'true' }}
-        run: python main.py --confirmar-publicacion
-
-      # Guarda el avance después de la publicación o de una pausa/error.
-      # El Python lo descarga automáticamente en la próxima ejecución.
-      - name: Guardar avance interno
-        if: ${{ always() && github.event_name != 'push' && inputs.solo_prueba != true && hashFiles('.vtex-lista-state/checkpoint.sqlite') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: vtex-estado-lista-v1
-          path: .vtex-lista-state/checkpoint.sqlite
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 6
