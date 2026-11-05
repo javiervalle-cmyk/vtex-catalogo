@@ -2,7 +2,8 @@ name: VTEX Catalogo
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - main.py
       - .github/workflows/vtex.yml
@@ -19,20 +20,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
   catalogo:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 250
 
     env:
       PYTHONUNBUFFERED: "1"
 
-      # Configuracion de extraccion VTEX
       MAX_WORKERS: "8"
       REQUESTS_PER_SECOND: "8"
       MAX_MINUTES: "220"
-
-      # Siempre ejecutar extraccion completa
-      SOLO_PRUEBA: "false"
 
     steps:
 
@@ -45,14 +45,18 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: python -m pip install "requests>=2.32,<3"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "requests>=2.32,<3"
 
       - name: Validar sintaxis
-        run: python -m py_compile main.py
+        run: |
+          python -m py_compile main.py
 
       - name: Ejecutar catalogo publico
         id: extraccion
-        run: python main.py
+        run: |
+          python main.py
 
       - name: Guardar CSV
         if: ${{ success() }}
