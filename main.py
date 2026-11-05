@@ -1,23 +1,26 @@
 """
-Extraccion publica VTEX por particiones, sin credenciales ni consultas por SKU.
+Extraccion regional del catalogo publico VTEX.
 
-Python 3.11+
-Dependencia:
-    pip install requests
+Paises:
+    SV, GT, NI y CR
 
 Salida:
     catalogo_CAM.csv
-    UTF-8 BOM
-    Separador ;
 
-SOLO_PRUEBA=true:
-    - Consulta hasta 100 productos por pais.
-    - Genera catalogo_CAM_prueba.csv.
-    - Nunca habilita la publicacion.
+Modo de prueba:
+    SOLO_PRUEBA=true
+    Genera catalogo_CAM_prueba.csv
 
-La cobertura se verifica contra el total anunciado por la API.
-Las paginas incompletas generan advertencias, pero la publicacion
-solo ocurre si la validacion final de cobertura es satisfactoria.
+Caracteristicas:
+    - Extraccion paralela.
+    - Control global de solicitudes por segundo.
+    - Reintentos para HTTP 429, HTTP 5xx y errores de red.
+    - Recuperacion de paginas incompletas.
+    - Tolerancia a cambios del total durante la lectura.
+    - Programacion automatica de paginas adicionales.
+    - Particion por categorias cuando una consulta supera 2500 productos.
+    - Validacion final antes de publicar.
+    - Escritura atomica del CSV.
 """
 
 import csv
@@ -37,9 +40,15 @@ from pathlib import Path
 import requests
 
 
+# ============================================================
+# CONFIGURACION GENERAL
+# ============================================================
+
 PAISES = {
-    pais: f"https://{pais.lower()}.siman.com"
-    for pais in ("SV", "GT", "NI", "CR")
+    "SV": "https://sv.siman.com",
+    "GT": "https://gt.siman.com",
+    "NI": "https://ni.siman.com",
+    "CR": "https://cr.siman.com",
 }
 
 
@@ -75,22 +84,48 @@ COLUMNAS = [
 
 
 PAGE_SIZE = 50
+
+# VTEX normalmente limita la busqueda publica a 2500 resultados.
 MAX_ITEMS = 2500
 
-# Cantidad de intentos adicionales cuando VTEX devuelve una pagina corta.
+# Reintentos de una pagina cuando regresa menos registros.
 SHORT_PAGE_RETRIES = 3
 
-# Pausa progresiva entre intentos de recuperación de una pagina corta.
+# Espera base entre reintentos de pagina corta.
 SHORT_PAGE_BASE_DELAY = 2.0
 
 
 class CoverageError(RuntimeError):
-    pass
+    """Error relacionado con cobertura o consistencia del catalogo."""
+
+
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
+
+def env_bool(name, default=False):
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "si",
+        "sí",
+    }
 
 
 def total_header(headers):
     """
-    Obtiene el total anunciado por VTEX desde Resources o Content-Range.
+    Obtiene el total reportado por VTEX.
+
+    Ejemplos:
+        Resources: 0-49/1135
+        Content-Range: resources 0-49/1135
     """
 
     normalized = {
@@ -104,12 +139,12 @@ def total_header(headers):
         or ""
     )
 
-    match = re.search(r"/\s*(\d+)\s*$", raw)
+    match = re.search(r"/\s*(\d+)\s*$", str(raw))
 
     if not match:
         raise CoverageError(
-            "La API no informo un total verificable "
-            "(Resources/Content-Range)."
+            "La API VTEX no informo un total verificable "
+            "en Resources o Content-Range."
         )
 
     return int(match.group(1))
@@ -118,7 +153,6 @@ def total_header(headers):
 def retry_after(value):
     """
     Convierte Retry-After a segundos.
-    Admite segundos numericos o una fecha HTTP.
     """
 
     try:
@@ -127,20 +161,92 @@ def retry_after(value):
     except (ValueError, TypeError):
         try:
             retry_date = parsedate_to_datetime(value)
-            return max(0.0, retry_date.timestamp() - time.time())
 
-        except (ValueError, TypeError, OverflowError):
+            return max(
+                0.0,
+                retry_date.timestamp() - time.time(),
+            )
+
+        except (
+            ValueError,
+            TypeError,
+            OverflowError,
+        ):
             return 0.0
 
 
+def available(offer):
+    """
+    Determina si una oferta aparece disponible para compra.
+    """
+
+    try:
+        quantity = float(
+            offer.get("AvailableQuantity") or 0
+        )
+
+        return (
+            offer.get("IsAvailable") is True
+            and quantity > 0
+        )
+
+    except (TypeError, ValueError):
+        return False
+
+
+def categories(nodes, path=()):
+    """
+    Convierte el arbol de categorias en un mapa:
+
+        ruta_categoria -> rutas_hijas
+    """
+
+    if not isinstance(nodes, list):
+        raise CoverageError(
+            "El arbol de categorias VTEX es invalido."
+        )
+
+    result = {}
+
+    for node in nodes:
+        node_id = str(node["id"])
+        key = path + (node_id,)
+
+        children = node.get("children") or []
+
+        result[key] = [
+            key + (str(child["id"]),)
+            for child in children
+        ]
+
+        result.update(
+            categories(children, key)
+        )
+
+    return result
+
+
+# ============================================================
+# CLIENTE HTTP
+# ============================================================
+
 class Client:
 
-    def __init__(self, rps=5.0, deadline_minutes=220):
+    def __init__(
+        self,
+        rps=8.0,
+        deadline_minutes=220,
+    ):
         self.rps = rps
-        self.deadline = time.monotonic() + deadline_minutes * 60
+
+        self.deadline = (
+            time.monotonic()
+            + deadline_minutes * 60
+        )
 
         self.lock = threading.Lock()
         self.local = threading.local()
+
         self.sessions = []
 
         self.next_request = 0.0
@@ -151,13 +257,16 @@ class Client:
 
     def pause(self, seconds):
         """
-        Espera sin superar el tiempo limite global.
+        Espera respetando el limite global de tiempo.
         """
 
-        if time.monotonic() + seconds >= self.deadline:
+        if (
+            time.monotonic() + seconds
+            >= self.deadline
+        ):
             raise TimeoutError(
-                "Limite de tiempo alcanzado; "
-                "no se publica una extraccion parcial."
+                "Se alcanzo el limite de tiempo. "
+                "No se publicara una extraccion parcial."
             )
 
         time.sleep(seconds)
@@ -173,16 +282,20 @@ class Client:
 
                 delay = max(
                     self.next_request,
-                    self.blocked_until
+                    self.blocked_until,
                 ) - now
 
                 if delay <= 0:
                     if now >= self.deadline:
                         raise TimeoutError(
-                            "Limite de tiempo alcanzado."
+                            "Se alcanzo el limite global "
+                            "de tiempo."
                         )
 
-                    self.next_request = now + (1 / self.rps)
+                    self.next_request = (
+                        now + (1 / self.rps)
+                    )
+
                     self.requests += 1
                     return
 
@@ -190,22 +303,26 @@ class Client:
 
     def get(self, url, params=None):
         """
-        Ejecuta una solicitud GET con retry para:
-        - HTTP 429
-        - HTTP 5xx
-        - timeout
-        - errores de conexion
-        - JSON invalido
+        GET con reintentos para:
+            - HTTP 429
+            - HTTP 5xx
+            - Timeout
+            - Conexion
+            - JSON invalido
         """
 
-        session = getattr(self.local, "session", None)
+        session = getattr(
+            self.local,
+            "session",
+            None,
+        )
 
         if session is None:
             session = requests.Session()
 
             session.headers.update({
                 "Accept": "application/json",
-                "User-Agent": "SimanCatalogExport/2.1",
+                "User-Agent": "SimanCatalogExport/3.0",
             })
 
             self.local.session = session
@@ -229,17 +346,22 @@ class Client:
                 ):
                     delay = max(
                         retry_after(
-                            response.headers.get("Retry-After")
+                            response.headers.get(
+                                "Retry-After"
+                            )
                         ),
-                        (2 ** attempt) + random.random(),
+                        (2 ** attempt)
+                        + random.random(),
                     )
 
                     with self.lock:
                         self.retries += 1
 
                         if response.status_code == 429:
-                            # Reducir gradualmente la velocidad global.
-                            self.rps = max(0.5, self.rps * 0.75)
+                            self.rps = max(
+                                0.5,
+                                self.rps * 0.80,
+                            )
 
                             self.blocked_until = max(
                                 self.blocked_until,
@@ -279,69 +401,33 @@ class Client:
                 with self.lock:
                     self.retries += 1
 
-                self.pause(
-                    (2 ** attempt) + random.random()
+                delay = (
+                    (2 ** attempt)
+                    + random.random()
                 )
 
-        raise RuntimeError("Reintentos HTTP agotados.")
+                self.pause(delay)
+
+        raise RuntimeError(
+            "Se agotaron los reintentos HTTP."
+        )
 
     def close(self):
         for session in self.sessions:
             session.close()
 
 
-def categories(nodes, path=()):
+# ============================================================
+# NORMALIZACION DE PRODUCTOS
+# ============================================================
+
+def rows_for_product(
+    pais,
+    product,
+    timestamp,
+):
     """
-    Convierte el arbol VTEX en un mapa:
-        ruta_categoria -> rutas_hijas
-    """
-
-    if not isinstance(nodes, list):
-        raise CoverageError(
-            "Arbol de categorias invalido."
-        )
-
-    result = {}
-
-    for node in nodes:
-        node_id = str(node["id"])
-        key = path + (node_id,)
-
-        children = node.get("children") or []
-
-        result[key] = [
-            key + (str(child["id"]),)
-            for child in children
-        ]
-
-        result.update(
-            categories(children, key)
-        )
-
-    return result
-
-
-def available(offer):
-    """
-    Determina si una oferta aparece disponible para compra.
-    """
-
-    try:
-        return (
-            offer.get("IsAvailable") is True
-            and float(
-                offer.get("AvailableQuantity") or 0
-            ) > 0
-        )
-
-    except (TypeError, ValueError):
-        return False
-
-
-def rows_for_product(pais, product, timestamp):
-    """
-    Convierte cada producto VTEX en una o varias filas,
-    una por SKU.
+    Convierte un producto VTEX en filas de SKU.
     """
 
     rows = []
@@ -357,36 +443,45 @@ def rows_for_product(pais, product, timestamp):
     seen = set()
 
     for item in items:
-        sku = str(item.get("itemId") or "")
+        sku = str(
+            item.get("itemId") or ""
+        )
 
-        if not sku or sku in seen:
+        if not sku:
             raise CoverageError(
-                "SKU vacio o repetido dentro de un producto."
+                "Se encontro un SKU sin itemId."
+            )
+
+        if sku in seen:
+            raise CoverageError(
+                f"SKU repetido dentro del producto: {sku}."
             )
 
         seen.add(sku)
 
         sellers = item.get("sellers") or []
 
-        # Mantiene la seleccion original:
-        # primero sellerDefault y, si no existe, el primer seller.
         seller = next(
             (
-                current_seller
-                for current_seller in sellers
-                if current_seller.get("sellerDefault")
+                current
+                for current in sellers
+                if current.get("sellerDefault")
             ),
             sellers[0] if sellers else {},
         )
 
-        offer = seller.get("commertialOffer") or {}
+        offer = (
+            seller.get("commertialOffer")
+            or {}
+        )
 
-        # Oferta especifica de Siman, sellerId = 1.
         siman = next(
             (
-                current_seller
-                for current_seller in sellers
-                if str(current_seller.get("sellerId")) == "1"
+                current
+                for current in sellers
+                if str(
+                    current.get("sellerId")
+                ) == "1"
             ),
             None,
         )
@@ -396,28 +491,35 @@ def rows_for_product(pais, product, timestamp):
             or {}
         )
 
-        refs = item.get("referenceId") or []
+        references = (
+            item.get("referenceId")
+            or []
+        )
 
-        ref = next(
+        ref_sku = next(
             (
                 reference.get("Value")
-                for reference in refs
+                for reference in references
                 if str(
                     reference.get("Key", "")
                 ).lower() == "refid"
             ),
-            refs[0].get("Value") if refs else None,
+            (
+                references[0].get("Value")
+                if references
+                else None
+            ),
         )
 
         images = item.get("images") or []
 
-        image = (
+        image_url = (
             images[0].get("imageUrl")
             if images
             else None
         )
 
-        buy = available(offer)
+        disponible = available(offer)
 
         product_id = str(
             product.get("productId") or ""
@@ -425,7 +527,7 @@ def rows_for_product(pais, product, timestamp):
 
         if not product_id:
             raise CoverageError(
-                "Producto sin productId."
+                "Se encontro un producto sin productId."
             )
 
         es_propio = None
@@ -433,7 +535,9 @@ def rows_for_product(pais, product, timestamp):
         if seller:
             es_propio = (
                 "Siman"
-                if str(seller.get("sellerId")) == "1"
+                if str(
+                    seller.get("sellerId")
+                ) == "1"
                 else "Marketplace"
             )
 
@@ -442,13 +546,13 @@ def rows_for_product(pais, product, timestamp):
             product.get("productReference"),
             product_id,
             product.get("productName"),
-            ref,
+            ref_sku,
             sku,
             item.get("name"),
-            "Y" if buy else "N",
+            "Y" if disponible else "N",
             (
                 "DISPONIBLE"
-                if buy
+                if disponible
                 else (
                     "SIN_OFERTA"
                     if not sellers
@@ -462,16 +566,21 @@ def rows_for_product(pais, product, timestamp):
             seller.get("sellerName"),
             product.get("brand"),
             product.get("link"),
-            image,
+            image_url,
             "Y",
-            "Y" if buy else "N",
+            "Y" if disponible else "N",
             seller.get("sellerId"),
             "Y" if siman else "N",
-            "Y" if available(siman_offer) else "N",
+            (
+                "Y"
+                if available(siman_offer)
+                else "N"
+            ),
             siman_offer.get("Price"),
-            "Y" if image else "N",
+            "Y" if image_url else "N",
 
-            # AvailableQuantity no se declara inventario fisico real.
+            # AvailableQuantity representa disponibilidad
+            # comercial VTEX, no inventario fisico garantizado.
             "N",
 
             timestamp,
@@ -479,15 +588,29 @@ def rows_for_product(pais, product, timestamp):
         ]
 
         rows.append(
-            dict(zip(COLUMNAS, values))
+            dict(
+                zip(
+                    COLUMNAS,
+                    values,
+                )
+            )
         )
 
     return rows
 
 
-def request_page(client, pais, path, start):
+# ============================================================
+# CONSULTA DE PAGINAS
+# ============================================================
+
+def request_page(
+    client,
+    pais,
+    path,
+    start,
+):
     """
-    Realiza una sola solicitud de pagina.
+    Ejecuta una solicitud a products/search.
     """
 
     params = {
@@ -517,66 +640,91 @@ def request_page(client, pais, path, start):
 
     return client.get(
         url,
-        params,
+        params=params,
     )
 
 
-def validate_page_data(pais, path, start, data):
+def validate_page_data(
+    pais,
+    path,
+    start,
+    data,
+):
     """
-    Valida la estructura y los IDs de una pagina.
+    Valida la estructura basica de una pagina.
     """
 
     if not isinstance(data, list):
         raise CoverageError(
-            f"Respuesta de productos invalida: "
-            f"{pais} {path} desde={start}."
+            "Respuesta invalida: "
+            f"pais={pais}; "
+            f"categoria={path}; "
+            f"desde={start}."
         )
 
     if len(data) > PAGE_SIZE:
         raise CoverageError(
-            f"Pagina excede PAGE_SIZE: "
-            f"{pais} {path} desde={start}; "
+            "Pagina excede PAGE_SIZE: "
+            f"pais={pais}; "
+            f"categoria={path}; "
+            f"desde={start}; "
             f"recibidos={len(data)}."
         )
 
     ids = [
-        str(product.get("productId") or "")
+        str(
+            product.get("productId")
+            or ""
+        )
         for product in data
     ]
 
     if any(not product_id for product_id in ids):
         raise CoverageError(
-            f"IDs vacios: "
-            f"{pais} {path} desde={start}."
+            "Pagina con productId vacio: "
+            f"pais={pais}; "
+            f"categoria={path}; "
+            f"desde={start}."
         )
 
     if len(set(ids)) != len(ids):
         raise CoverageError(
-            f"IDs repetidos en pagina: "
-            f"{pais} {path} desde={start}."
+            "Pagina con productId repetido: "
+            f"pais={pais}; "
+            f"categoria={path}; "
+            f"desde={start}."
         )
 
 
-def fetch_page(client, pais, path, start):
+def fetch_page(
+    client,
+    pais,
+    path,
+    start,
+):
     """
-    Obtiene una pagina de productos.
+    Recupera una pagina.
 
-    Si VTEX devuelve menos productos de los esperados:
-    1. Reintenta la misma pagina.
-    2. Conserva la respuesta mas completa.
-    3. Emite una advertencia.
-    4. Permite continuar.
-    5. La validacion final decide si se publica.
+    Si la pagina regresa menos productos de los esperados:
+        - Reintenta hasta SHORT_PAGE_RETRIES.
+        - Conserva la respuesta mas completa.
+        - Emite advertencia.
+        - Permite continuar.
+
+    La cobertura se valida nuevamente al finalizar.
     """
 
     best_data = None
     best_total = None
     best_received = -1
+
     totals_seen = []
 
-    attempts = SHORT_PAGE_RETRIES + 1
+    total_attempts = (
+        SHORT_PAGE_RETRIES + 1
+    )
 
-    for attempt in range(attempts):
+    for attempt in range(total_attempts):
         data, headers = request_page(
             client,
             pais,
@@ -595,7 +743,7 @@ def fetch_page(client, pais, path, start):
 
         totals_seen.append(total)
 
-        expected = min(
+        expected_count = min(
             PAGE_SIZE,
             max(0, total - start),
         )
@@ -605,7 +753,7 @@ def fetch_page(client, pais, path, start):
             best_total = total
             best_received = len(data)
 
-        if len(data) == expected:
+        if len(data) == expected_count:
             return data, total
 
         if attempt < SHORT_PAGE_RETRIES:
@@ -621,7 +769,7 @@ def fetch_page(client, pais, path, start):
                 f"categoria={path}; "
                 f"desde={start}; "
                 f"recibidos={len(data)}; "
-                f"esperados={expected}; "
+                f"esperados={expected_count}; "
                 f"total={total}; "
                 f"intento={attempt + 1}/"
                 f"{SHORT_PAGE_RETRIES}",
@@ -632,12 +780,11 @@ def fetch_page(client, pais, path, start):
 
     if len(set(totals_seen)) > 1:
         print(
-            "ADVERTENCIA TOTAL VARIABLE: "
+            "ADVERTENCIA TOTAL VARIABLE EN REINTENTO: "
             f"pais={pais}; "
             f"categoria={path}; "
             f"desde={start}; "
-            f"totales={totals_seen}; "
-            f"se_usara={best_total}",
+            f"totales={totals_seen}.",
             flush=True,
         )
 
@@ -653,23 +800,26 @@ def fetch_page(client, pais, path, start):
         f"desde={start}; "
         f"recibidos={len(best_data)}; "
         f"esperados={final_expected}; "
-        f"total={best_total}; "
-        "la extraccion continuara y se validara "
-        "la cobertura al final.",
+        f"total={best_total}. "
+        "La extraccion continuara.",
         flush=True,
     )
 
     return best_data, best_total
 
 
+# ============================================================
+# EXTRACCION GENERAL
+# ============================================================
+
 def collect(
     client,
-    workers=6,
+    workers=8,
     test=False,
     countries=None,
 ):
     """
-    Recorre los catalogos de los paises solicitados.
+    Extrae todos los paises solicitados.
     """
 
     countries = list(
@@ -681,6 +831,10 @@ def collect(
     ).isoformat()
 
     trees = {}
+
+    # --------------------------------------------------------
+    # Descargar arbol de categorias
+    # --------------------------------------------------------
 
     for pais in countries:
         category_url = (
@@ -699,21 +853,97 @@ def collect(
             for node in tree
         ]
 
+    # --------------------------------------------------------
+    # Estructuras de control
+    # --------------------------------------------------------
+
     tasks = deque(
         (pais, (), 0)
         for pais in countries
     )
 
-    expected = {}
+    # Para impedir programar dos veces el mismo offset.
+    scheduled = {
+        (pais, ()): {0}
+        for pais in countries
+    }
+
+    # Primer total observado.
+    initial_total = {}
+
+    # Menor total observado.
+    minimum_total = {}
+
+    # Mayor total observado.
+    maximum_total = {}
+
+    # Ultimo total observado.
+    latest_total = {}
+
+    # Productos encontrados por ruta.
     members = {}
+
+    # Rutas que se dividieron en subcategorias.
     split = {}
 
+    # Filas finales por pais + sku.
     rows = {}
-    owner = {}
+
+    # Productos ya normalizados por pais.
+    owner = set()
+
+    # Contador de repeticiones entre paginas.
+    repeated_products = 0
 
     done_pages = 0
     started = time.monotonic()
     last_report = 0.0
+
+    def schedule_offsets(
+        pais,
+        path,
+        total,
+    ):
+        """
+        Programa todos los offsets que todavia no hayan
+        sido agregados para la ruta indicada.
+
+        Si el total VTEX aumenta durante la lectura,
+        agrega automaticamente las paginas nuevas.
+        """
+
+        key = (
+            pais,
+            path,
+        )
+
+        if key not in scheduled:
+            scheduled[key] = set()
+
+        limit = (
+            min(total, 100)
+            if test
+            else total
+        )
+
+        for offset in range(
+            PAGE_SIZE,
+            limit,
+            PAGE_SIZE,
+        ):
+            if offset not in scheduledscheduled[key].add(offset)
+
+                tasks.append(
+                    (
+                        pais,
+                        path,
+                        offset,
+                    )
+                )
+
+    # --------------------------------------------------------
+    # Procesamiento paralelo
+    # --------------------------------------------------------
 
     with ThreadPoolExecutor(
         max_workers=workers
@@ -755,35 +985,55 @@ def collect(
                     path,
                 )
 
-                comparable = (
+                comparable_total = (
                     min(total, 100)
                     if test
                     else total
                 )
 
-                previous = (
-                    min(
-                        expected.get(key, total),
-                        100,
-                    )
-                    if test
-                    else expected.get(key, total)
-                )
+                if key not in initial_total:
+                    initial_total[key] = total
+                    minimum_total[key] = total
+                    maximum_total[key] = total
+                    latest_total[key] = total
 
-                if (
-                    key in expected
-                    and previous != comparable
-                ):
-                    raise CoverageError(
-                        "El total cambio durante la lectura: "
-                        f"{pais} {path}. "
-                        "Reintentar la extraccion."
+                else:
+                    previous_total = latest_total[key]
+
+                    minimum_total[key] = min(
+                        minimum_total[key],
+                        total,
                     )
 
-                expected[key] = total
+                    maximum_total[key] = max(
+                        maximum_total[key],
+                        total,
+                    )
 
+                    latest_total[key] = total
+
+                    if previous_total != total:
+                        print(
+                            "ADVERTENCIA TOTAL VARIABLE: "
+                            f"pais={pais}; "
+                            f"categoria={path}; "
+                            f"desde={start}; "
+                            f"total_anterior={previous_total}; "
+                            f"total_actual={total}; "
+                            f"total_minimo="
+                            f"{minimum_total[key]}; "
+                            f"total_maximo="
+                            f"{maximum_total[key]}.",
+                            flush=True,
+                        )
+
+                # La primera pagina define si la ruta debe
+                # dividirse o paginarse normalmente.
                 if start == 0:
-                    members[key] = set()
+                    members.setdefault(
+                        key,
+                        set(),
+                    )
 
                     if (
                         total > MAX_ITEMS
@@ -798,69 +1048,93 @@ def collect(
                             raise CoverageError(
                                 f"{pais} categoria {path}: "
                                 f"{total} productos supera "
-                                f"{MAX_ITEMS}; requiere otra "
-                                "particion. No se publicara "
-                                "un CSV truncado."
+                                f"el limite de {MAX_ITEMS} "
+                                "y no existen subcategorias."
                             )
 
                         split[key] = children
 
-                        tasks.extend(
-                            (
+                        for child in children:
+                            child_key = (
                                 pais,
                                 child,
-                                0,
                             )
-                            for child in children
-                        )
 
-                        continue
+                            scheduled.setdefault(
+                                child_key,
+                                set(),
+                            )
 
-                    limit = (
-                        min(total, 100)
-                        if test
-                        else total
-                    )
+                            if 0 not in scheduledscheduled[child_key].add(0)
 
-                    tasks.extend(
-                        (
+                                tasks.append(
+                                    (
+                                        pais,
+                                        child,
+                                        0,
+                                    )
+                                )
+
+                    else:
+                        schedule_offsets(
                             pais,
                             path,
-                            offset,
+                            total,
                         )
-                        for offset in range(
-                            PAGE_SIZE,
-                            limit,
-                            PAGE_SIZE,
-                        )
+
+                elif key not in split:
+                    # Si el total crecio en una pagina posterior,
+                    # programar automaticamente los nuevos offsets.
+                    schedule_offsets(
+                        pais,
+                        path,
+                        maximum_total[key],
                     )
+
+                # ------------------------------------------------
+                # Procesar productos de la pagina
+                # ------------------------------------------------
+
+                members.setdefault(
+                    key,
+                    set(),
+                )
 
                 for product in data:
-                    pid = str(
-                        product.get("productId") or ""
+                    product_id = str(
+                        product.get("productId")
+                        or ""
                     )
 
-                    if not pid:
+                    if not product_id:
                         raise CoverageError(
-                            f"Producto sin ID: "
-                            f"{pais} {path} desde={start}."
+                            "Producto sin ID: "
+                            f"pais={pais}; "
+                            f"categoria={path}; "
+                            f"desde={start}."
                         )
 
-                    if pid in members[key]:
-                        raise CoverageError(
-                            "Paginacion repetida: "
-                            f"{pais} {path} "
-                            f"producto={pid}."
-                        )
-
-                    members[key].add(pid)
-
-                    # Un producto puede aparecer en varias categorias.
-                    # Solo se normaliza una vez por pais.
-                    if (pais, pid) in owner:
+                    # En un catalogo vivo, un producto puede
+                    # moverse de una pagina a otra mientras
+                    # se ejecuta la extraccion.
+                    if product_id in membersrepeated_products += 1
                         continue
 
-                    owner[pais, pid] = True
+                    members[key].add(
+                        product_id
+                    )
+
+                    owner_key = (
+                        pais,
+                        product_id,
+                    )
+
+                    # Un producto puede aparecer en varias
+                    # categorias. Solo se normaliza una vez.
+                    if owner_key in owner:
+                        continue
+
+                    owner.add(owner_key)
 
                     product_rows = rows_for_product(
                         pais,
@@ -874,13 +1148,20 @@ def collect(
                             row["sku_id"],
                         )
 
+                        existing = rows.get(
+                            row_key
+                        )
+
                         if (
-                            row_key in rows
-                            and rows[row_key]["productId"] != pid
+                            existing is not None
+                            and existing["productId"]
+                            != product_id
                         ):
                             raise CoverageError(
-                                "Un SKU pertenece a dos "
-                                "productos diferentes."
+                                "Un mismo SKU aparece en "
+                                "dos productos diferentes: "
+                                f"pais={pais}; "
+                                f"sku={row['sku_id']}."
                             )
 
                         rows[row_key] = row
@@ -889,7 +1170,10 @@ def collect(
 
             current_time = time.monotonic()
 
-            if current_time - last_report >= 15:
+            if (
+                current_time - last_report
+                >= 15
+            ):
                 print(
                     "AVANCE: "
                     f"paginas={done_pages}; "
@@ -899,21 +1183,42 @@ def collect(
                     "minutos="
                     f"{(current_time - started) / 60:.1f}; "
                     f"solicitudes={client.requests}; "
-                    f"reintentos={client.retries}",
+                    f"reintentos={client.retries}; "
+                    "productos_repetidos="
+                    f"{repeated_products}",
                     flush=True,
                 )
 
                 last_report = current_time
 
-    def validate(pais, path):
+    # ========================================================
+    # VALIDACION FINAL
+    # ========================================================
+
+    validation_cache = {}
+
+    def validate(
+        pais,
+        path,
+    ):
         """
-        Valida recursivamente la cobertura de una ruta.
+        Valida recursivamente la cobertura.
+
+        Para rutas divididas:
+            Une los productos de las subcategorias.
+
+        Para rutas directas:
+            Consulta nuevamente la primera pagina y compara
+            el total actual con los IDs recuperados.
         """
 
         key = (
             pais,
             path,
         )
+
+        if key in validation_cache:
+            return validation_cache[key]
 
         if key in split:
             ids = set()
@@ -927,80 +1232,126 @@ def collect(
                 )
 
         else:
-            ids = members[key]
+            ids = set(
+                members.get(
+                    key,
+                    set(),
+                )
+            )
 
-        goal = (
-            min(expected[key], 100)
-            if test
-            else expected[key]
+        if test:
+            goal = min(
+                latest_total.get(
+                    key,
+                    len(ids),
+                ),
+                100,
+            )
+
+            if not ids:
+                raise CoverageError(
+                    f"{pais} {path}: "
+                    "resultado de prueba vacio."
+                )
+
+            validation_cache[key] = ids
+            return ids
+
+        # Obtener un total actualizado.
+        control_page, fresh_total = fetch_page(
+            client,
+            pais,
+            path,
+            0,
         )
 
-        if (
-            len(ids) != goal
-            and not test
-        ):
-            # Revalidar contra un total fresco.
-            probe, fresh_total = fetch_page(
-                client,
-                pais,
-                path,
-                0,
+        control_ids = {
+            str(
+                product.get("productId")
+                or ""
             )
+            for product in control_page
+        }
 
-            control_present = all(
-                str(
-                    product.get("productId") or ""
-                ) in ids
-                for product in probe
-            )
+        missing_control = (
+            control_ids - ids
+        )
 
-            if (
-                len(ids) == fresh_total
-                and control_present
-            ):
-                print(
-                    f"TOTAL REVALIDADO {pais} {path}: "
-                    f"{goal} -> {fresh_total}",
-                    flush=True,
-                )
-
-                expected[key] = fresh_total
-                goal = fresh_total
-
-            elif (
-                path == ()
-                and key in split
-                and len(ids) > fresh_total
-                and control_present
-            ):
-                # La union de categorias puede exponer
-                # mas productos que la consulta sin filtro.
-                print(
-                    f"COBERTURA POR CATEGORIAS {pais}: "
-                    f"{len(ids)}; "
-                    "busqueda sin filtro="
-                    f"{fresh_total}. "
-                    "Se conservan los productos adicionales.",
-                    flush=True,
-                )
-
-                goal = len(ids)
-
-        if len(ids) != goal:
-            missing = goal - len(ids)
-
+        if missing_control:
             raise CoverageError(
-                f"Cobertura incompleta {pais} {path}: "
-                f"{len(ids)}/{goal}; "
-                f"diferencia={missing}. "
-                "La API devolvio paginas incompletas, "
-                "el catalogo cambio durante la extraccion "
-                "o existen productos no cubiertos por "
-                "las subcategorias. No se publicara "
-                "el archivo."
+                "La pagina de control contiene productos "
+                "que no fueron recuperados: "
+                f"pais={pais}; "
+                f"categoria={path}; "
+                f"faltantes_control="
+                f"{len(missing_control)}."
             )
+
+        recovered = len(ids)
+
+        if key in split:
+            # Para rutas divididas, la union de categorias
+            # puede ser mayor al total de la busqueda general.
+            if recovered < fresh_total:
+                raise CoverageError(
+                    "Cobertura incompleta por categorias: "
+                    f"pais={pais}; "
+                    f"categoria={path}; "
+                    f"recuperados={recovered}; "
+                    f"total_actual={fresh_total}."
+                )
+
+            if recovered > fresh_total:
+                print(
+                    "COBERTURA POR CATEGORIAS: "
+                    f"pais={pais}; "
+                    f"categoria={path}; "
+                    f"recuperados={recovered}; "
+                    f"busqueda_general={fresh_total}. "
+                    "Se conservan los productos "
+                    "adicionales encontrados en categorias.",
+                    flush=True,
+                )
+
+        else:
+            # Si el catalogo disminuyo, puede haber mas IDs
+            # recuperados que el total actual. Eso es valido.
+            #
+            # Si recuperamos menos que el total actual,
+            # la extraccion se considera incompleta.
+            if recovered < fresh_total:
+                raise CoverageError(
+                    "Cobertura incompleta: "
+                    f"pais={pais}; "
+                    f"categoria={path}; "
+                    f"recuperados={recovered}; "
+                    f"total_inicial="
+                    f"{initial_total.get(key)}; "
+                    f"total_minimo="
+                    f"{minimum_total.get(key)}; "
+                    f"total_maximo="
+                    f"{maximum_total.get(key)}; "
+                    f"total_actual={fresh_total}."
+                )
+
+            if recovered > fresh_total:
+                print(
+                    "CATALOGO CAMBIO DURANTE LA LECTURA: "
+                    f"pais={pais}; "
+                    f"categoria={path}; "
+                    f"recuperados={recovered}; "
+                    f"total_actual={fresh_total}. "
+                    "Se conservan los productos recuperados.",
+                    flush=True,
+                )
+
+        validation_cache[key] = ids
 
         return ids
+
+    # --------------------------------------------------------
+    # Resumen final por pais
+    # --------------------------------------------------------
 
     summary = {}
 
@@ -1011,39 +1362,66 @@ def collect(
         )
 
         sku_count = sum(
-            key[0] == pais
-            for key in rows
+            1
+            for row_key in rows
+            if row_key[0] == pais
         )
 
-        if not products or not sku_count:
+        if not products:
             raise CoverageError(
-                f"{pais}: resultado vacio; "
-                "revisar antes de publicar."
+                f"{pais}: no se recuperaron productos."
             )
+
+        if not sku_count:
+            raise CoverageError(
+                f"{pais}: no se recuperaron SKU."
+            )
+
+        fresh_total = latest_total.get(
+            (pais, ()),
+            len(products),
+        )
 
         summary[pais] = {
             "productos": len(products),
             "skus": sku_count,
-            "total_api": expected[pais, ()],
+            "total_inicial": initial_total.get(
+                (pais, ())
+            ),
+            "total_minimo": minimum_total.get(
+                (pais, ())
+            ),
+            "total_maximo": maximum_total.get(
+                (pais, ())
+            ),
+            "total_ultimo": fresh_total,
         }
 
     return rows, summary
 
 
-def write_csv(rows, path, complete):
+# ============================================================
+# ESCRITURA DEL CSV
+# ============================================================
+
+def write_csv(
+    rows,
+    path,
+    complete,
+):
     """
-    Escribe primero un archivo temporal y luego reemplaza
+    Escribe el CSV en un temporal y luego reemplaza
     atomicamente el archivo final.
     """
 
     path = Path(path)
 
-    tmp = path.with_suffix(
+    temporary_path = path.with_suffix(
         path.suffix + ".tmp"
     )
 
     try:
-        with tmp.open(
+        with temporary_path.open(
             "w",
             encoding="utf-8-sig",
             newline="",
@@ -1067,56 +1445,68 @@ def write_csv(rows, path, complete):
                     ),
                 }
 
-                writer.writerow(output_row)
+                writer.writerow(
+                    output_row
+                )
 
         os.replace(
-            tmp,
+            temporary_path,
             path,
         )
 
     finally:
-        tmp.unlink(
+        temporary_path.unlink(
             missing_ok=True
         )
 
 
-def output(name, value):
+# ============================================================
+# GITHUB ACTIONS OUTPUT
+# ============================================================
+
+def output(
+    name,
+    value,
+):
     """
-    Escribe variables de salida para GitHub Actions.
+    Escribe una variable en GITHUB_OUTPUT.
     """
 
     github_output = os.getenv(
         "GITHUB_OUTPUT"
     )
 
-    if github_output:
-        with open(
-            github_output,
-            "a",
-            encoding="utf-8",
-        ) as stream:
-            stream.write(
-                f"{name}={value}\n"
-            )
+    if not github_output:
+        return
 
+    with open(
+        github_output,
+        "a",
+        encoding="utf-8",
+    ) as stream:
+        stream.write(
+            f"{name}={value}\n"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     """
     Punto principal del proceso.
     """
 
-    # Por seguridad, la publicacion inicia deshabilitada.
+    # Siempre inicia bloqueando la publicacion.
     output(
         "publicar",
         "false",
     )
 
-    test = (
-        os.getenv(
-            "SOLO_PRUEBA",
-            "false",
-        ).lower()
-        == "true"
+    test = env_bool(
+        "SOLO_PRUEBA",
+        False,
     )
 
     workers = max(
@@ -1126,7 +1516,7 @@ def main():
             int(
                 os.getenv(
                     "MAX_WORKERS",
-                    "6",
+                    "8",
                 )
             ),
         ),
@@ -1139,7 +1529,7 @@ def main():
             float(
                 os.getenv(
                     "REQUESTS_PER_SECOND",
-                    "5",
+                    "8",
                 )
             ),
         ),
@@ -1165,7 +1555,8 @@ def main():
     print(
         "API PUBLICA: "
         f"hilos={workers}; "
-        f"solicitudes/s={client.rps}; "
+        "solicitudes/s="
+        f"{requests_per_second}; "
         f"prueba={test}",
         flush=True,
     )
@@ -1210,6 +1601,7 @@ def main():
             flush=True,
         )
 
+        # Solo se habilita la publicacion si todo finalizo.
         output(
             "publicar",
             "false" if test else "true",
