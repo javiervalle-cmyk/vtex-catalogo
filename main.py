@@ -35,6 +35,11 @@ MAX_ITEMS = 2500
 SHORT_PAGE_RETRIES = 3
 SHORT_PAGE_BASE_DELAY = 2.0
 
+# Tolerancia para diferencias de la foto final del catalogo vivo.
+# Deben cumplirse AMBAS condiciones para aceptar la diferencia.
+MAX_ROOT_MISSING_ABS = 100
+MAX_ROOT_MISSING_PCT = 0.005  # 0.5%
+
 
 class CoverageError(RuntimeError):
     pass
@@ -551,10 +556,38 @@ def collect(client, workers=8, countries=None):
                 f"Validacion raiz fallo: pais={pais}; faltantes={len(missing_root)}"
             )
         if len(root_ids) < current_root_total:
-            raise CoverageError(
-                "Cobertura raiz incompleta: "
-                f"pais={pais}; recuperados={len(root_ids)}; total_actual={current_root_total}"
+            missing_count = current_root_total - len(root_ids)
+            missing_pct = (
+                missing_count / current_root_total
+                if current_root_total
+                else 0.0
             )
+
+            within_tolerance = (
+                missing_count <= MAX_ROOT_MISSING_ABS
+                and missing_pct <= MAX_ROOT_MISSING_PCT
+            )
+
+            if within_tolerance:
+                print(
+                    "ADVERTENCIA COBERTURA RAIZ DENTRO DE TOLERANCIA: "
+                    f"pais={pais}; recuperados={len(root_ids)}; "
+                    f"total_actual={current_root_total}; faltantes={missing_count}; "
+                    f"porcentaje={missing_pct:.4%}; "
+                    f"limite_abs={MAX_ROOT_MISSING_ABS}; "
+                    f"limite_pct={MAX_ROOT_MISSING_PCT:.2%}. "
+                    "Se acepta por variacion del catalogo durante la lectura.",
+                    flush=True,
+                )
+            else:
+                raise CoverageError(
+                    "Cobertura raiz incompleta fuera de tolerancia: "
+                    f"pais={pais}; recuperados={len(root_ids)}; "
+                    f"total_actual={current_root_total}; faltantes={missing_count}; "
+                    f"porcentaje={missing_pct:.4%}; "
+                    f"limite_abs={MAX_ROOT_MISSING_ABS}; "
+                    f"limite_pct={MAX_ROOT_MISSING_PCT:.2%}"
+                )
         if len(root_ids) > current_root_total:
             print(
                 "COBERTURA POR CATEGORIAS: "
