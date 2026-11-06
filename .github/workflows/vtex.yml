@@ -10,7 +10,7 @@ on:
 
   schedule:
     # 3:00 a. m. hora de El Salvador (UTC-6)
-    - cron: "0 9 * * *"
+    - cron: "0 5 * * *"
 
 permissions:
   contents: write
